@@ -10,11 +10,12 @@ import os
 import sys
 import csv
 import threading
+from collections import OrderedDict
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from fractions import Fraction
 from datetime import datetime
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageTk, UnidentifiedImageError
 
 import piexif
 
@@ -296,6 +297,12 @@ class ExifCraft:
         self.input_files: list[str] = []
         self.worker: threading.Thread | None = None
 
+        # preview state: LRU cache (path -> PhotoImage) + the currently shown
+        # image (kept alive on the instance so Tk never GCs it) + debounce id
+        self._preview_cache: OrderedDict[str, ImageTk.PhotoImage] = OrderedDict()
+        self._preview_photo: ImageTk.PhotoImage | None = None
+        self._preview_after_id: str | None = None
+
         # string vars (defaults empty — let the user fill in)
         self.src_var   = tk.StringVar()
         self.out_var   = tk.StringVar()
@@ -549,6 +556,7 @@ class ExifCraft:
                            style="Vertical.TScrollbar", command=self.file_list.yview)
         sb.pack(side="right", fill="y")
         self.file_list.configure(yscrollcommand=sb.set)
+        self.file_list.bind("<<ListboxSelect>>", self._schedule_preview)
 
         # list footer
         list_footer = ttk.Frame(src_card.body, style="CardInner.TFrame")
@@ -569,6 +577,22 @@ class ExifCraft:
         # --- right column
         right = ttk.Frame(body, style="App.TFrame")
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        # Preview card — visual confirmation of the selected file
+        prev_card = Card(right, title="Preview  ·  预览")
+        prev_card.pack(fill="x")
+
+        prev_box = tk.Frame(prev_card.body, bg=Theme.SURFACE_2, height=240)
+        prev_box.pack(fill="x")
+        prev_box.pack_propagate(False)               # keep the box height fixed
+        self._preview_lbl = tk.Label(
+            prev_box, text="选择文件以预览",
+            bg=Theme.SURFACE_2, fg=Theme.TEXT_3, font=Theme.FONT,
+        )
+        self._preview_lbl.pack(fill="both", expand=True)
+
+        self._preview_meta = ttk.Label(prev_card.body, text="", style="Hint.TLabel")
+        self._preview_meta.pack(anchor="w", pady=(2, 0))
 
         # Camera card
         cam_card = Card(right, title="Camera  ·  相机")
@@ -712,6 +736,111 @@ class ExifCraft:
         return frame
 
     # ------------------------------------------------------------------
+    #  Preview states
+    # ------------------------------------------------------------------
+    def _preview_state(self, state: str, text: str = "", meta: str = ""):
+        """Switch the preview area between its four states.
+
+        state: "empty" (nothing selected) | "loading" | "error" | "ready"
+        The "ready" state is driven by _show_preview() via the image config.
+        """
+        self._preview_lbl.configure(
+            text=text,
+            fg={"empty": Theme.TEXT_3, "error": Theme.ERROR}.get(state, Theme.TEXT_2),
+        )
+        self._preview_meta.configure(text=meta)
+
+    # ------------------------------------------------------------------
+    #  Preview rendering
+    # ------------------------------------------------------------------
+    PREVIEW_MAX   = (360, 240)   # box size; images are contain-fit inside it
+    PREVIEW_CACHE = 20           # LRU entries — bounds memory on big folders
+
+    def _load_thumb_image(self, path: str):
+        """Decode + downscale *path* into a PIL image ready for PhotoImage.
+
+        Returns (img, (w, h)) where (w, h) is the orientation-corrected
+        *source* resolution for the meta line. Raises on undecodable files.
+
+        Performance: draft() lets Pillow decode JPEG at 1/8 scale directly
+        (huge on network drives); exif_transpose() fixes portrait shots;
+        thumbnail() does the final contain-fit.
+        """
+        img = Image.open(path)
+        w, h = img.size
+        orient = img.getexif().get(0x0112, 1)      # 274 = Orientation
+        if orient in (5, 6, 7, 8):                 # 90/270 deg rotations
+            w, h = h, w
+        img.draft("RGB", self.PREVIEW_MAX)
+        img = ImageOps.exif_transpose(img)
+        img.thumbnail(self.PREVIEW_MAX)
+        return img, (w, h)
+
+    def _make_thumb(self, path: str):
+        """Tk wrapper around _load_thumb_image."""
+        img, size = self._load_thumb_image(path)
+        return ImageTk.PhotoImage(img), size
+
+    def _show_preview(self, path: str):
+        if path in self._preview_cache:                    # cache hit: zero decode
+            self._preview_cache.move_to_end(path)
+            self._preview_photo = self._preview_cache[path]
+            self._preview_lbl.configure(image=self._preview_photo, text="")
+            self._set_preview_meta(path)
+            return
+
+        self._preview_state("loading", "载入中…", os.path.basename(path))
+        try:
+            photo, (w, h) = self._make_thumb(path)
+        except Exception as e:
+            self._preview_state("error", "无法解码此格式", os.path.basename(path))
+            self._log(f"预览失败 {os.path.basename(path)}: {e}", "err")
+            return
+
+        self._preview_cache[path] = photo                  # dict holds the ref
+        self._cache_put(path, photo)
+        self._preview_photo = photo                        # instance ref: no GC
+        self._preview_lbl.configure(image=photo, text="")
+        self._preview_state("ready", "", self._meta_text(path, w, h))
+
+    def _cache_put(self, path: str, photo):
+        """Insert into the LRU cache and evict oldest entries beyond the cap."""
+        self._preview_cache[path] = photo
+        self._preview_cache.move_to_end(path)
+        while len(self._preview_cache) > self.PREVIEW_CACHE:
+            self._preview_cache.popitem(last=False)
+
+    def _meta_text(self, path: str, w: int, h: int) -> str:
+        try:
+            kb = os.path.getsize(path) / 1024
+            return f"{os.path.basename(path)}  ·  {w}×{h}  ·  {kb:.0f} KB"
+        except OSError:
+            return os.path.basename(path)
+
+    def _set_preview_meta(self, path: str):
+        """Meta line for a cache hit — size is read back from the cached entry."""
+        try:
+            with Image.open(path) as im:
+                size = ImageOps.exif_transpose(im).size
+            self._preview_state("ready", "", self._meta_text(path, *size))
+        except Exception:
+            self._preview_state("ready", "", os.path.basename(path))
+
+    def _schedule_preview(self, *_):
+        """<<ListboxSelect>> handler with 100 ms debounce for rapid clicking."""
+        if self._preview_after_id:
+            self.root.after_cancel(self._preview_after_id)
+        self._preview_after_id = self.root.after(100, self._preview_for_selection)
+
+    def _preview_for_selection(self):
+        self._preview_after_id = None
+        sel = self.file_list.curselection()
+        if not sel or not (0 <= sel[0] < len(self.input_files)):
+            self._preview_state("empty", "选择文件以预览", "")
+            return
+        self._show_preview(self.input_files[sel[0]])
+
+    # ------------------------------------------------------------------
     #  Logging & status
     # ------------------------------------------------------------------
     def _log(self, msg, level="info"):
@@ -764,6 +893,7 @@ class ExifCraft:
         self.input_files.clear()
         self.src_var.set("")
         self._refresh_list()
+        self._preview_state("empty", "选择文件以预览", "")
         self._log("File list cleared.", "muted")
 
     def _refresh_list(self):
@@ -774,6 +904,11 @@ class ExifCraft:
         self.list_count_lbl.configure(
             text=f"{n} file{'s' if n != 1 else ''} loaded"
         )
+        if n:                                   # auto-select first → fires preview
+            self.file_list.selection_set(0)
+            # NB: Tk does not guarantee <<ListboxSelect>> for a programmatic
+            # selection_set, so schedule the preview explicitly here.
+            self._schedule_preview()
 
     # ------------------------------------------------------------------
     #  Read existing EXIF
