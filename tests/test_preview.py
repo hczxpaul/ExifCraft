@@ -7,13 +7,27 @@ from PIL import Image
 from conftest import ExifCraft
 
 
-@pytest.fixture
-def app(mod):
-    """A live app instance (needs a Tk root for PhotoImage); destroyed after."""
+@pytest.fixture(scope="session")
+def tk_root():
+    """One Tk root for the whole session — creating/destroying many roots
+    in one process fails on Windows after ~7 iterations (Tcl limitation)."""
     root = tk.Tk()
-    a = mod.ExifCraft(root)
-    yield a
+    yield root
     root.destroy()
+
+
+@pytest.fixture
+def app(mod, tk_root):
+    """A live app instance on the shared root; its widgets are torn down after."""
+    a = mod.ExifCraft(tk_root)
+    yield a
+    if a._preview_after_id:
+        try:
+            tk_root.after_cancel(a._preview_after_id)
+        except Exception:
+            pass
+    for child in tk_root.winfo_children():
+        child.destroy()
 
 
 class TestThumbGeneration:
