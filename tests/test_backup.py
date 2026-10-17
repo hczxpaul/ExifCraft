@@ -218,7 +218,7 @@ class TestSafeWrite:
 PARAMS = dict(
     longitude="114.05", latitude="22.54", altitude="12",
     focal_length="35", aperture="2.8", iso="200",
-    make="NIKON", model="Z6 II", date="2024:05:06 07:08:09",
+    make="NIKON", model="Z6 II", datetime="2024:05:06 07:08:09",
 )
 
 

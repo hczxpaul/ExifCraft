@@ -343,6 +343,68 @@ class Validator:
 
         return len(errs) == 0, errs
 
+    # ---- partial-write validation (feature 2) ---------------------------
+    FIELD_LABELS = {
+        "longitude": "经度", "latitude": "纬度", "altitude": "海拔",
+        "focal_length": "焦距", "aperture": "光圈", "iso": "ISO",
+        "make": "相机制造商", "model": "相机型号", "datetime": "拍摄日期",
+    }
+    NUMERIC_RULES = {
+        "longitude":    dict(lo=-180, hi=180),
+        "latitude":     dict(lo=-90,  hi=90),
+        "altitude":     dict(),
+        "focal_length": dict(lo=0.01),
+        "aperture":     dict(lo=0.01),
+        "iso":          dict(lo=1, integer=True),
+    }
+
+    @classmethod
+    def check_fields(cls, fields: dict) -> tuple[bool, list[str]]:
+        """Validate only the fields that will actually be written.
+
+        A field present with value None means "clear it" — nothing to check.
+        An empty dict means the user asked for a no-op, which is an error.
+        """
+        errs: list[str] = []
+        if not fields:
+            return False, ["请至少勾选一个要修改的字段"]
+
+        def _num(label, raw, *, lo=None, hi=None, integer=False):
+            s = (raw or "").strip()
+            if not s:
+                errs.append(f"{label} 不能为空")
+                return
+            try:
+                v = int(s) if integer else float(s)
+            except (TypeError, ValueError):
+                errs.append(f"{label} 必须为{'整数' if integer else '数字'}")
+                return
+            if lo is not None and v < lo:
+                errs.append(f"{label} 不能小于 {lo}")
+            if hi is not None and v > hi:
+                errs.append(f"{label} 不能大于 {hi}")
+
+        for name, rules in cls.NUMERIC_RULES.items():
+            if name in fields and fields[name] is not None:
+                _num(cls.FIELD_LABELS[name], fields[name], **rules)
+
+        for name in ("make", "model"):
+            if name in fields and fields[name] is not None:
+                if not str(fields[name]).strip():
+                    errs.append(f"{cls.FIELD_LABELS[name]}不能为空")
+
+        if "datetime" in fields and fields["datetime"] is not None:
+            d = str(fields["datetime"]).strip()
+            if not d:
+                errs.append("拍摄日期不能为空")
+            else:
+                try:
+                    datetime.strptime(d, "%Y:%m:%d %H:%M:%S")
+                except ValueError:
+                    errs.append("日期格式错误，应为 YYYY:MM:DD HH:MM:SS")
+
+        return len(errs) == 0, errs
+
 
 # =====================================================================
 #  Backup / rollback — session write journal
@@ -785,7 +847,28 @@ class ExifCraft:
             "focal_length":  tk.StringVar(),
             "aperture":      tk.StringVar(),
             "iso":           tk.StringVar(),
+            "make":          tk.StringVar(),
+            "model":         tk.StringVar(),
         }
+        # keep the historical names pointing at the same vars
+        self.make_var  = self.field_vars["make"]
+        self.model_var = self.field_vars["model"]
+
+        # --- three-state editing: check = write this field, ✕ = clear it,
+        #     unchecked = leave the file's existing value alone
+        self.write_flags = {n: tk.BooleanVar(value=True) for n in self.field_vars}
+        self.clear_flags = {n: tk.BooleanVar(value=False) for n in self.field_vars}
+        for n, v in self.field_vars.items():
+            # typing anything cancels a pending "clear"
+            v.trace_add("write", lambda *a, _n=n: self.clear_flags[_n].set(False))
+
+        self._field_entries: dict[str, ttk.Entry] = {}
+        for n, flag in self.write_flags.items():
+            flag.trace_add("write", lambda *a: self._sync_field_styles())
+
+        self.date_flag  = tk.BooleanVar(value=True)    # date participates?
+        self.date_clear = tk.BooleanVar(value=False)   # or gets removed?
+        self.gps_clear  = tk.BooleanVar(value=False)   # drop the whole GPS block
 
         self._build()
         self._setup_window()          # needs measured widget sizes → after _build
@@ -955,6 +1038,15 @@ class ExifCraft:
               foreground=[("active", base.TEXT)],
               indicatorcolor=[("selected", base.PRIMARY), ("!selected", base.SURFACE)])
 
+        # Compact checkbox used next to field labels (no padding, no focus ring)
+        s.configure("Field.TCheckbutton",
+                    background=base.SURFACE, focuscolor=base.SURFACE,
+                    indicatorcolor=base.SURFACE, bordercolor=base.BORDER_FOCUS,
+                    padding=0, font=(base.FONT[0], base.FONT[1] - 1))
+        s.map("Field.TCheckbutton",
+              background=[("active", base.SURFACE)],
+              indicatorcolor=[("selected", base.PRIMARY), ("!selected", base.SURFACE)])
+
     # ------------------------------------------------------------------
     #  Layout
     # ------------------------------------------------------------------
@@ -1070,8 +1162,10 @@ class ExifCraft:
         cam_grid.pack(fill="x")
         cam_grid.columnconfigure(0, weight=1, uniform="cam")
         cam_grid.columnconfigure(1, weight=1, uniform="cam")
-        self._labeled_entry(cam_grid, "Make",  self.make_var,  col=0, hint="e.g. Nikon")
-        self._labeled_entry(cam_grid, "Model", self.model_var, col=1, hint="e.g. Z6 II")
+        self._labeled_entry(cam_grid, "Make",  self.make_var,  col=0, field="make",
+                            hint="e.g. Nikon")
+        self._labeled_entry(cam_grid, "Model", self.model_var, col=1, field="model",
+                            hint="e.g. Z6 II")
 
         # Exposure card
         exp_card = Card(right, title="Exposure  ·  曝光参数")
@@ -1082,9 +1176,12 @@ class ExifCraft:
         for c in range(3):
             grid.columnconfigure(c, weight=1, uniform="exp")
 
-        self._labeled_entry(grid, "Focal (mm)",   self.field_vars["focal_length"], col=0)
-        self._labeled_entry(grid, "Aperture (F)", self.field_vars["aperture"],     col=1)
-        self._labeled_entry(grid, "ISO",          self.field_vars["iso"],          col=2)
+        self._labeled_entry(grid, "Focal (mm)",   self.field_vars["focal_length"],
+                            col=0, field="focal_length")
+        self._labeled_entry(grid, "Aperture (F)", self.field_vars["aperture"],
+                            col=1, field="aperture")
+        self._labeled_entry(grid, "ISO",          self.field_vars["iso"],
+                            col=2, field="iso")
 
         # Date card
         date_card = Card(right, title="Date  ·  拍摄时间")
@@ -1092,7 +1189,13 @@ class ExifCraft:
 
         row = ttk.Frame(date_card.body, style="CardInner.TFrame")
         row.pack(fill="x")
-        ttk.Label(row, text="Date", style="Field.TLabel").grid(row=0, column=0, sticky="w")
+        # DateEntry has no "empty" state (clearing it snaps back to today), so
+        # the whole date row is gated by a checkbox instead of by its text.
+        ttk.Checkbutton(row, variable=self.date_flag, style="Field.TCheckbutton"
+                        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(row, text="Date", style="Field.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Button(row, text="✕", width=2, style="Subtle.TButton",
+                   command=self._clear_date).grid(row=0, column=5, sticky="e", padx=(4, 0))
         if HAS_CALENDAR:
             self.date_picker = DateEntry(row, width=14, date_pattern="yyyy-MM-dd",
                                          background=Theme.SURFACE, foreground=Theme.TEXT,
@@ -1119,17 +1222,22 @@ class ExifCraft:
             grid.columnconfigure(c, weight=1, uniform="gps")
 
         self._labeled_entry(grid, "Longitude", self.field_vars["longitude"],
-                            col=0, hint="-180 ~ 180")
+                            col=0, field="longitude", hint="-180 ~ 180")
         self._labeled_entry(grid, "Latitude",  self.field_vars["latitude"],
-                            col=1, hint="-90 ~ 90")
+                            col=1, field="latitude", hint="-90 ~ 90")
 
-        self._labeled_entry(gps_card.body, "Altitude (m)", self.field_vars["altitude"])
+        self._labeled_entry(gps_card.body, "Altitude (m)", self.field_vars["altitude"],
+                            field="altitude")
 
-        # map button (if available)
+        # GPS actions row: drop the whole location block, or pick one on a map
+        gps_actions = ttk.Frame(gps_card.body, style="CardInner.TFrame")
+        gps_actions.pack(fill="x", pady=(6, 0))
+        self.gps_clear_btn = ttk.Button(gps_actions, text="✕ 清除 GPS 信息",
+                                        style="Subtle.TButton",
+                                        command=self._toggle_clear_gps)
+        self.gps_clear_btn.pack(side="left")
         if HAS_MAP:
-            map_btn_row = ttk.Frame(gps_card.body, style="CardInner.TFrame")
-            map_btn_row.pack(fill="x", pady=(6, 0))
-            ttk.Button(map_btn_row, text="📍 Pick on map",
+            ttk.Button(gps_actions, text="📍 Pick on map",
                        style="Ghost.TButton",
                        command=self._open_map).pack(side="right")
 
@@ -1193,20 +1301,76 @@ class ExifCraft:
         self.err_lbl = ttk.Label(status_bar, text="", style="Err.TLabel")
         self.err_lbl.pack(side="right")
 
-    def _labeled_entry(self, parent, label, var, *, hint=None, col=None):
-        """Build a label + entry (+ optional hint) block. Returns its frame."""
+    def _labeled_entry(self, parent, label, var, *, hint=None, col=None, field=None):
+        """Build a label + entry (+ optional hint) block. Returns its frame.
+
+        When *field* is given the block gets a small checkbox (include this
+        field in the write) and a ✕ button (clear this field instead).
+        """
         frame = ttk.Frame(parent, style="CardInner.TFrame")
         if col is not None:
             frame.grid(row=0, column=col, sticky="nsew",
                        padx=(0 if col == 0 else 8, 0), pady=2)
         else:
             frame.pack(fill="x", pady=2)
-        ttk.Label(frame, text=label, style="Field.TLabel").pack(anchor="w")
-        ttk.Entry(frame, textvariable=var, style="Field.TEntry",
-                  font=Theme.FONT_MONO, width=1).pack(fill="x", pady=(3, 0))
+
+        head = ttk.Frame(frame, style="CardInner.TFrame")
+        head.pack(fill="x")
+        if field:
+            ttk.Checkbutton(head, variable=self.write_flags[field],
+                            style="Field.TCheckbutton").pack(side="left", padx=(0, 3))
+        ttk.Label(head, text=label, style="Field.TLabel").pack(side="left")
+        if field:
+            ttk.Button(head, text="✕", width=2, style="Subtle.TButton",
+                       command=lambda f=field: self._clear_field(f)).pack(side="right")
+
+        entry = ttk.Entry(frame, textvariable=var, style="Field.TEntry",
+                          font=Theme.FONT_MONO, width=1)
+        entry.pack(fill="x", pady=(3, 0))
+        if field:
+            self._field_entries[field] = entry
         if hint:
             ttk.Label(frame, text=hint, style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
         return frame
+
+    def _clear_date(self) -> None:
+        """Mark the capture time for removal (or undo that)."""
+        if self.date_clear.get():
+            self.date_clear.set(False)
+            self._log("取消清除拍摄时间。", "muted")
+            return
+        self.date_clear.set(True)
+        self.date_flag.set(True)
+        self._log("已标记清除拍摄时间。", "muted")
+
+    def _toggle_clear_gps(self) -> None:
+        """Mark the whole GPS block for removal (or undo that)."""
+        if self.gps_clear.get():
+            self.gps_clear.set(False)
+            self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
+            self._log("取消清除 GPS。", "muted")
+            return
+        self.gps_clear.set(True)
+        self.gps_clear_btn.configure(text="✓ 将清除 GPS 信息")
+        self._log("下次写入将清除 GPS 信息（经纬度、海拔）。", "warn")
+
+    def _clear_field(self, field: str) -> None:
+        """Mark a field for removal on the next write (and empty its box)."""
+        if self.clear_flags[field].get():          # toggle back off
+            self.clear_flags[field].set(False)
+            return
+        self.field_vars[field].set("")
+        self.write_flags[field].set(True)
+        self.clear_flags[field].set(True)
+        self._log(f"已标记清除字段：{field}", "muted")
+
+    def _sync_field_styles(self) -> None:
+        """Dim entries of fields that will not be written."""
+        for name, entry in self._field_entries.items():
+            if not self.write_flags[name].get():
+                entry.state(["disabled"])
+            else:
+                entry.state(["!disabled"])
 
     # ------------------------------------------------------------------
     #  Preview states
@@ -1419,6 +1583,17 @@ class ExifCraft:
                 if not HAS_CALENDAR:
                     self.date_str_var.set(info["datetime"])
 
+        # ---- three-state flags after a read: everything visible is selected
+        # (what you see is what gets written), nothing is pending clearance
+        for name in self.field_vars:
+            self.clear_flags[name].set(False)
+            self.write_flags[name].set(bool(self.field_vars[name].get().strip()))
+        self.date_flag.set(bool(info["datetime"]))
+        self.date_clear.set(False)
+        self.gps_clear.set(False)
+        self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
+        self._sync_field_styles()
+
         self._log(f"Loaded EXIF from {os.path.basename(path)}", "ok")
 
     # ------------------------------------------------------------------
@@ -1467,17 +1642,20 @@ class ExifCraft:
     #  Writing (off the UI thread)
     # ------------------------------------------------------------------
     def _collect_params(self):
-        p = {
-            "longitude":     self.field_vars["longitude"].get(),
-            "latitude":      self.field_vars["latitude"].get(),
-            "altitude":      self.field_vars["altitude"].get(),
-            "focal_length":  self.field_vars["focal_length"].get(),
-            "aperture":      self.field_vars["aperture"].get(),
-            "iso":           self.field_vars["iso"].get(),
-            "make":          self.make_var.get(),
-            "model":         self.model_var.get(),
-            "date":          self._date_string(),
-        }
+        """Build the partial-write field set from the three-state UI.
+
+        Only checked fields appear. A checked-but-cleared field yields None
+        (meaning "delete that tag").
+        """
+        p: dict = {}
+        for name, var in self.field_vars.items():
+            if not self.write_flags[name].get():
+                continue                                  # leave the file's value
+            p[name] = None if self.clear_flags[name].get() else var.get()
+        if self.date_flag.get():
+            p["datetime"] = None if self.date_clear.get() else self._date_string()
+        if self.gps_clear.get():
+            p["clear_gps"] = True
         return p
 
     def _date_string(self):
@@ -1494,8 +1672,8 @@ class ExifCraft:
             messagebox.showerror(self.APP_NAME, "Pick at least one image first.")
             return
 
-        params = self._collect_params()
-        ok, errs = Validator.check(**params)
+        fields = self._collect_params()
+        ok, errs = Validator.check_fields(fields)
         if not ok:
             self._set_error("  ·  ".join(errs))
             messagebox.showerror(self.APP_NAME, "\n".join(errs))
@@ -1510,16 +1688,19 @@ class ExifCraft:
         self.progress["maximum"] = len(self.input_files)
         self.progress_text.configure(text=f"0 / {len(self.input_files)}")
         self._set_status("Writing…")
-        self._log(f"Starting write of {len(self.input_files)} file(s)…", "muted")
+        names = ", ".join(k for k in fields if k != "clear_gps")
+        self._log(f"开始写入 {len(self.input_files)} 个文件"
+                  f"（字段：{names or '仅清除 GPS'}）…", "muted")
 
         self.worker = threading.Thread(
             target=self._write_worker,
-            args=(list(self.input_files), out_dir, params, overwrite),
+            args=(list(self.input_files), out_dir, fields, overwrite),
             daemon=True,
         )
         self.worker.start()
 
-    def _write_worker(self, files, out_dir, params, overwrite):
+    def _write_worker(self, files, out_dir, fields: dict, overwrite):
+        """Write *fields* (a partial field set) into every file in *files*."""
         success = 0
         total = len(files)
         # defensive: the worker owns the destination, so make sure it exists
@@ -1531,17 +1712,6 @@ class ExifCraft:
                                 self._log(f"Cannot create output dir: {m}", "err"))
                 self.root.after(0, lambda: self._finish_write(0, total))
                 return
-        # normalize numeric values
-        try:
-            lon = float(params["longitude"])
-            lat = float(params["latitude"])
-            alt = float(params["altitude"]) if (params["altitude"] or "").strip() else 0.0
-            fl  = float(params["focal_length"])
-            ap  = float(params["aperture"])
-            iso = int(params["iso"])
-        except (TypeError, ValueError) as e:
-            self.root.after(0, lambda: self._log(f"Bad numeric input: {e}", "err"))
-            return
 
         for idx, src in enumerate(files, 1):
             base = os.path.basename(src)
@@ -1563,11 +1733,8 @@ class ExifCraft:
                 continue
 
             def save_to(path, _img=img):
-                apply_exif(_img, path,
-                           longitude=lon, latitude=lat, altitude=alt,
-                           focal_length=fl, aperture=ap, iso=iso,
-                           make=params["make"], model=params["model"],
-                           shot_date=params["date"])
+                # partial write: only the keys in fields are touched
+                apply_exif_fields(_img, path, fields)
 
             rec = None
             if self.bm is not None:
