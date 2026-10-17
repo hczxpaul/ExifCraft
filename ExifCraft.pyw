@@ -863,8 +863,10 @@ class ExifCraft:
             v.trace_add("write", lambda *a, _n=n: self.clear_flags[_n].set(False))
 
         self._field_entries: dict[str, ttk.Entry] = {}
+        self._toggle_chips: dict[str, tuple[tk.Label, str]] = {}
+        self._clear_btns: dict[str, tk.Button] = {}
         for n, flag in self.write_flags.items():
-            flag.trace_add("write", lambda *a: self._sync_field_styles())
+            flag.trace_add("write", lambda *a: self._refresh_fields_ui())
 
         self.date_flag  = tk.BooleanVar(value=True)    # date participates?
         self.date_clear = tk.BooleanVar(value=False)   # or gets removed?
@@ -1190,12 +1192,39 @@ class ExifCraft:
         row = ttk.Frame(date_card.body, style="CardInner.TFrame")
         row.pack(fill="x")
         # DateEntry has no "empty" state (clearing it snaps back to today), so
-        # the whole date row is gated by a checkbox instead of by its text.
-        ttk.Checkbutton(row, variable=self.date_flag, style="Field.TCheckbutton"
-                        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(row, text="Date", style="Field.TLabel").grid(row=0, column=1, sticky="w")
-        ttk.Button(row, text="✕", width=2, style="Subtle.TButton",
-                   command=self._clear_date).grid(row=0, column=5, sticky="e", padx=(4, 0))
+        # the whole date row is gated by a toggle chip instead of by its text.
+        # Each widget gets its own grid column — label and picker overlapped before.
+        date_chip = tk.Label(row, text="☑ Date", font=Theme.FONT_BOLD,
+                             bg=Theme.SURFACE, fg=Theme.PRIMARY_H,
+                             cursor="hand2", padx=2)
+        date_chip.grid(row=0, column=0, sticky="w")
+
+        def _render_date_chip(*_):
+            if self.date_flag.get():
+                date_chip.configure(text="☑ Date", fg=Theme.PRIMARY_H, bg=Theme.PRIMARY_S)
+            else:
+                date_chip.configure(text="☐ Date", fg=Theme.TEXT_3, bg=Theme.SURFACE)
+
+        def _toggle_date(_e=None):
+            self.date_flag.set(not self.date_flag.get())
+
+        date_chip.bind("<Button-1>", _toggle_date)
+        self.date_flag.trace_add("write", _render_date_chip)
+
+        date_clear_btn = tk.Button(row, text="✕", width=2, bd=0, relief="flat",
+                                   bg=Theme.SURFACE, fg=Theme.TEXT_3, cursor="hand2",
+                                   activebackground=Theme.PRIMARY_S,
+                                   activeforeground=Theme.PRIMARY_H,
+                                   font=(Theme.FONT[0], Theme.FONT[1]),
+                                   command=self._clear_date)
+        date_clear_btn.grid(row=0, column=5, sticky="e", padx=(4, 0))
+
+        def _render_date_clear(*_):
+            date_clear_btn.configure(
+                text="↺" if self.date_clear.get() else "✕",
+                fg=Theme.ERROR if self.date_clear.get() else Theme.TEXT_3)
+
+        self.date_clear.trace_add("write", _render_date_clear)
         if HAS_CALENDAR:
             self.date_picker = DateEntry(row, width=14, date_pattern="yyyy-MM-dd",
                                          background=Theme.SURFACE, foreground=Theme.TEXT,
@@ -1211,6 +1240,15 @@ class ExifCraft:
                       style="Field.TEntry", font=Theme.FONT_MONO, width=24
                       ).grid(row=0, column=1, columnspan=3, sticky="we", padx=(8, 0), pady=2)
         row.columnconfigure(1, weight=1)
+
+        # ---- quick-selection row: the "batch edit GPS only" shortcut
+        quick = ttk.Frame(right, style="App.TFrame")
+        quick.pack(fill="x", pady=(8, 0))
+        ttk.Label(quick, text="快捷选择：", style="Hint.TLabel").pack(side="left")
+        ttk.Button(quick, text="仅改 GPS", style="Subtle.TButton",
+                   command=self._quick_gps_only).pack(side="left", padx=(4, 0))
+        ttk.Button(quick, text="全选字段", style="Subtle.TButton",
+                   command=self._quick_select_all).pack(side="left", padx=(4, 0))
 
         # GPS card (under exposure)
         gps_card = Card(right, title="Location  ·  GPS 坐标")
@@ -1301,11 +1339,15 @@ class ExifCraft:
         self.err_lbl = ttk.Label(status_bar, text="", style="Err.TLabel")
         self.err_lbl.pack(side="right")
 
+        # initial render: chips are created as "☐" but all fields start checked
+        self._refresh_fields_ui()
+
     def _labeled_entry(self, parent, label, var, *, hint=None, col=None, field=None):
         """Build a label + entry (+ optional hint) block. Returns its frame.
 
-        When *field* is given the block gets a small checkbox (include this
-        field in the write) and a ✕ button (clear this field instead).
+        When *field* is given the label becomes a click-to-toggle chip:
+        ☑ Field (will be written) / ☐ Field (left untouched), plus a ✕
+        button that marks the field for removal instead.
         """
         frame = ttk.Frame(parent, style="CardInner.TFrame")
         if col is not None:
@@ -1317,12 +1359,18 @@ class ExifCraft:
         head = ttk.Frame(frame, style="CardInner.TFrame")
         head.pack(fill="x")
         if field:
-            ttk.Checkbutton(head, variable=self.write_flags[field],
-                            style="Field.TCheckbutton").pack(side="left", padx=(0, 3))
-        ttk.Label(head, text=label, style="Field.TLabel").pack(side="left")
-        if field:
-            ttk.Button(head, text="✕", width=2, style="Subtle.TButton",
-                       command=lambda f=field: self._clear_field(f)).pack(side="right")
+            head.pack_forget()                      # rebuild below with the chip
+            head = tk.Frame(frame, bg=Theme.SURFACE)
+            head.pack(fill="x")
+            chip = self._make_field_chip(head, field, label)
+            chip.pack(side="left")
+            self._clear_btns[field] = tk.Button(
+                head, text="✕", width=2, bd=0, relief="flat",
+                bg=Theme.SURFACE, fg=Theme.TEXT_3, cursor="hand2",
+                activebackground=Theme.PRIMARY_S, activeforeground=Theme.PRIMARY_H,
+                font=(Theme.FONT[0], Theme.FONT[1]),
+                command=lambda f=field: self._clear_field(f))
+            self._clear_btns[field].pack(side="right")
 
         entry = ttk.Entry(frame, textvariable=var, style="Field.TEntry",
                           font=Theme.FONT_MONO, width=1)
@@ -1332,6 +1380,52 @@ class ExifCraft:
         if hint:
             ttk.Label(frame, text=hint, style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
         return frame
+
+    def _make_field_chip(self, parent, field: str, label: str) -> tk.Label:
+        """A big, unmissable toggle: ☑ Field / ☐ Field with colour coding."""
+        chip = tk.Label(parent, text=f"☐ {label}", font=Theme.FONT_BOLD,
+                        bg=Theme.SURFACE, fg=Theme.TEXT_3, cursor="hand2", padx=2)
+        chip.bind("<Button-1>", lambda e: self.write_flags[field].set(
+            not self.write_flags[field].get()))
+        self._toggle_chips[field] = (chip, label)
+        return chip
+
+    def _refresh_fields_ui(self) -> None:
+        """Sync every field's visuals with its three-state flags.
+
+        - chip:   ☑ on light blue = will be written; ☐ grey = untouched
+        - entry:  disabled when the field is excluded or pending clearance
+        - ✕/↺:   marks (or un-marks) a field for deletion
+        """
+        for name, entry in self._field_entries.items():
+            active = self.write_flags[name].get() and not self.clear_flags[name].get()
+            entry.state(["!disabled"] if active else ["disabled"])
+        for name, (chip, label) in self._toggle_chips.items():
+            if self.write_flags[name].get():
+                chip.configure(text=f"☑ {label}", fg=Theme.PRIMARY_H,
+                               bg=Theme.PRIMARY_S)
+            else:
+                chip.configure(text=f"☐ {label}", fg=Theme.TEXT_3,
+                               bg=Theme.SURFACE)
+        for name, btn in self._clear_btns.items():
+            btn.configure(text="↺" if self.clear_flags[name].get() else "✕",
+                          fg=Theme.ERROR if self.clear_flags[name].get()
+                          else Theme.TEXT_3)
+
+    def _quick_gps_only(self) -> None:
+        """One-click setup for the most common job: batch-edit GPS only."""
+        for n in self.field_vars:
+            self.write_flags[n].set(n in ("longitude", "latitude", "altitude"))
+        self.date_flag.set(False)
+        self.gps_clear.set(False)
+        self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
+        self._log("已切换为仅修改 GPS：其他字段将保持原文件中的值。", "ok")
+
+    def _quick_select_all(self) -> None:
+        for n in self.field_vars:
+            self.write_flags[n].set(True)
+        self.date_flag.set(True)
+        self._log("已勾选全部字段（含拍摄时间）。", "muted")
 
     def _clear_date(self) -> None:
         """Mark the capture time for removal (or undo that)."""
@@ -1358,19 +1452,13 @@ class ExifCraft:
         """Mark a field for removal on the next write (and empty its box)."""
         if self.clear_flags[field].get():          # toggle back off
             self.clear_flags[field].set(False)
-            return
-        self.field_vars[field].set("")
-        self.write_flags[field].set(True)
-        self.clear_flags[field].set(True)
-        self._log(f"已标记清除字段：{field}", "muted")
-
-    def _sync_field_styles(self) -> None:
-        """Dim entries of fields that will not be written."""
-        for name, entry in self._field_entries.items():
-            if not self.write_flags[name].get():
-                entry.state(["disabled"])
-            else:
-                entry.state(["!disabled"])
+            self._log(f"取消清除字段：{field}", "muted")
+        else:
+            self.field_vars[field].set("")
+            self.write_flags[field].set(True)
+            self.clear_flags[field].set(True)
+            self._log(f"已标记清除字段：{field}", "muted")
+        self._refresh_fields_ui()
 
     # ------------------------------------------------------------------
     #  Preview states
@@ -1592,7 +1680,7 @@ class ExifCraft:
         self.date_clear.set(False)
         self.gps_clear.set(False)
         self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
-        self._sync_field_styles()
+        self._refresh_fields_ui()
 
         self._log(f"Loaded EXIF from {os.path.basename(path)}", "ok")
 

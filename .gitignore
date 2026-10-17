@@ -13,6 +13,23 @@ dist/
 venv/
 env/
 
+# ---- Test / coverage artifacts ----
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# ---- ExifCraft runtime data ----
+# .exifcraft/ holds the backup/rollback session journal written at runtime
+# (BackupManager in ExifCraft.pyw). Never commit it.
+.exifcraft/
+# In-place overwrite backups created next to user images:
+# ._ExifCraft_bak_<session>_<name>.exifbak
+*.exifbak
+._ExifCraft_bak_*
+
 # ---- IDE / editor ----
 .idea/
 .vscode/
