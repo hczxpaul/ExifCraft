@@ -11,6 +11,7 @@ import sys
 import csv
 import json
 import uuid
+import atexit
 import shutil
 import ctypes
 import tempfile
@@ -595,6 +596,50 @@ class BackupManager:
                         orphans += 1
         return restored, orphans
 
+    @staticmethod
+    def purge_orphans(app_dir: str) -> int:
+        """Delete backup files that no journal references. Returns the count.
+
+        Only files matching our own naming convention are ever touched.
+        """
+        sessions_dir = BackupManager._pick_dir(app_dir)
+        managed: set[str] = set()
+        for name in os.listdir(sessions_dir):
+            if not name.endswith(".json") or name.startswith("_"):
+                continue
+            try:
+                with open(os.path.join(sessions_dir, name), encoding="utf-8") as fp:
+                    data = json.load(fp)
+            except (OSError, json.JSONDecodeError):
+                continue
+            for d in data.get("records", []):
+                if d.get("backup"):
+                    managed.add(os.path.abspath(d["backup"]))
+
+        scan_dirs: set[str] = set()
+        try:
+            with open(os.path.join(sessions_dir, "_dirs.json"), encoding="utf-8") as fp:
+                scan_dirs = set(json.load(fp))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        removed = 0
+        for d in scan_dirs:
+            if not os.path.isdir(d):
+                continue
+            for f in os.listdir(d):
+                if not (f.startswith(BAK_PREFIX) and f.endswith(BAK_SUFFIX)):
+                    continue
+                p = os.path.abspath(os.path.join(d, f))
+                if p in managed:
+                    continue
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
+
 
 # =====================================================================
 #  UI building blocks
@@ -1029,6 +1074,11 @@ class ExifCraft:
         ttk.Button(actions, text="Read folder EXIF → CSV",
                    style="Ghost.TButton",
                    command=self._export_csv).pack(side="left", padx=6)
+
+        self.rollback_btn = ttk.Button(actions, text="↩ Rollback",
+                                       style="Ghost.TButton", state="disabled",
+                                       command=self._rollback_clicked)
+        self.rollback_btn.pack(side="left", padx=6)
 
         # progress
         prog_row = ttk.Frame(outer, style="App.TFrame")
@@ -1477,6 +1527,40 @@ class ExifCraft:
         self.root.after(0, lambda s=success, t=total:
                         self._finish_write(s, t))
 
+    # ------------------------------------------------------------------
+    #  Rollback (UI)
+    # ------------------------------------------------------------------
+    def _update_rollback_btn(self) -> None:
+        n = self.bm.backup_count() if self.bm is not None else 0
+        self.rollback_btn.configure(state="normal" if n else "disabled")
+
+    def _rollback_clicked(self) -> None:
+        if self.bm is None or not self.bm.recs:
+            return
+        n = self.bm.backup_count()
+        mb = self.bm.backup_bytes() / 1024 / 1024
+        if not messagebox.askyesno(
+                self.APP_NAME,
+                f"撤销本次会话的全部修改？\n\n"
+                f"将还原 {n} 个文件（备份占用 {mb:.1f} MB）。"):
+            return
+        done, skipped = self.bm.rollback()
+        self._log(f"回滚完成，还原 {done} 项。", "ok" if done else "warn")
+        self._set_status(f"已回滚 {done} 项")
+        self.progress_text.configure(text="")
+        self._update_rollback_btn()
+        if skipped:
+            messagebox.showwarning(
+                self.APP_NAME,
+                "以下文件在修改后被外部改动过，已跳过（备份仍保留）：\n\n"
+                + "\n".join(os.path.basename(p) for p in skipped[:12])
+                + ("\n…" if len(skipped) > 12 else ""))
+
+    def _atexit_cleanup(self) -> None:
+        """Last-resort cleanup if the window died without going through _on_close."""
+        if self.bm is not None and self.bm.recs:
+            self.bm.cleanup()
+
     def _backup_text(self) -> str:
         """Status suffix showing what we currently hold for rollback."""
         if self.bm is None:
@@ -1491,6 +1575,7 @@ class ExifCraft:
         self.progress["value"] = 0
         self.progress_text.configure(text=self._backup_text().lstrip("· "))
         self._set_status(f"Done  ·  {success}/{total} succeeded  {self._backup_text()}")
+        self._update_rollback_btn()
         self._log(f"Finished. {success}/{total} succeeded.", "ok"
                   if success == total else "warn")
         messagebox.showinfo(self.APP_NAME,
@@ -1525,6 +1610,30 @@ class ExifCraft:
     #  Lifecycle
     # ------------------------------------------------------------------
     def _on_close(self):
+        """Exit flow: offer rollback, then always release the backups."""
+        if self.bm is not None and self.bm.recs:
+            n = self.bm.backup_count()
+            mb = self.bm.backup_bytes() / 1024 / 1024
+            choice = messagebox.askyesnocancel(
+                self.APP_NAME,
+                f"本次会话已修改 {len(self.bm.recs)} 个文件"
+                f"（备份 {n} 个 / {mb:.1f} MB）。\n\n"
+                f"【是】撤销全部修改并退出\n"
+                f"【否】保留修改，删除备份并退出\n"
+                f"【取消】返回程序")
+            if choice is None:                       # cancel: stay
+                return
+            if choice:                               # yes: roll back
+                done, skipped = self.bm.rollback()
+                self._log(f"退出前回滚：还原 {done} 项"
+                          + (f"，跳过 {len(skipped)} 项" if skipped else ""),
+                          "ok" if done and not skipped else "warn")
+                if skipped:
+                    messagebox.showwarning(
+                        self.APP_NAME,
+                        f"{len(skipped)} 个文件在修改后被外部改动，未回滚（备份保留在原目录）。")
+        if self.bm is not None:
+            self.bm.cleanup()                        # backups + journal gone
         try:
             self.root.destroy()
         except Exception:
@@ -1551,7 +1660,25 @@ def enable_dpi_awareness():
 def main():
     enable_dpi_awareness()
     root = tk.Tk()
-    ExifCraft(root)
+    app = ExifCraft(root)
+    atexit.register(app._atexit_cleanup)   # safety net if mainloop dies abruptly
+
+    # ---- crash recovery for a previous run (UI exists → findings are logged)
+    try:
+        restored, orphans = BackupManager.recover_sessions(APP_DIR)
+        if restored:
+            app._log(f"上次异常退出：已自动还原 {restored} 个文件。", "warn")
+        if orphans:
+            app._log(f"发现 {orphans} 个残留备份文件（无会话记录）。", "warn")
+            if messagebox.askyesno(
+                    app.APP_NAME,
+                    f"发现 {orphans} 个残留备份文件（上次未正常退出留下）。\n\n"
+                    f"现在删除它们以释放空间？"):
+                removed = BackupManager.purge_orphans(APP_DIR)
+                app._log(f"已清理 {removed} 个残留备份。", "ok")
+    except Exception as e:
+        app._log(f"启动恢复检查失败：{e}", "err")
+
     root.mainloop()
 
 
