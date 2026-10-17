@@ -138,27 +138,96 @@ def apply_exif(img, output_path, *, longitude, latitude, altitude,
     Split out of set_exif_data so callers can load an image into memory first:
     overwrite mode renames the source away before saving, so re-opening the
     path inside would fail.
+
+    Full write: every field is replaced. For partial edits use
+    apply_exif_fields(), which only touches the keys you pass.
     """
-    if 'exif' in img.info:
-        exif_dict = piexif.load(img.info['exif'])
+    fields = {
+        "longitude": longitude, "latitude": latitude, "altitude": altitude,
+        "focal_length": focal_length, "aperture": aperture, "iso": iso,
+        "make": make, "model": model, "datetime": shot_date,
+    }
+    apply_exif_fields(img, output_path, fields)
+
+
+# name -> (IFD, tag, value kind)
+SIMPLE_FIELDS = {
+    "make":         ("0th",  piexif.ImageIFD.Make,             "str"),
+    "model":        ("0th",  piexif.ImageIFD.Model,            "str"),
+    "datetime":     ("Exif", piexif.ExifIFD.DateTimeOriginal,  "str"),
+    "focal_length": ("Exif", piexif.ExifIFD.FocalLength,       "rational"),
+    "aperture":     ("Exif", piexif.ExifIFD.FNumber,           "rational"),
+    "iso":          ("Exif", piexif.ExifIFD.ISOSpeedRatings,   "int"),
+}
+
+
+def apply_exif_fields(img, output_path, fields: dict, *, exif_dict=None):
+    """Write only the EXIF fields present in *fields*; everything else is kept.
+
+    Args:
+        img: an already-opened PIL image.
+        output_path: destination path.
+        fields: {field_name: value}. Absent key = leave the existing tag
+            untouched; value None = delete that tag ("clear this field").
+            Recognised names are the SIMPLE_FIELDS keys plus
+            "longitude" / "latitude" / "altitude" (GPS) and "clear_gps"
+            (True → drop the whole GPS block).
+        exif_dict: optional pre-loaded piexif dict (used by tests).
+
+    Raises:
+        ValueError: if a numeric field cannot be parsed.
+    """
+    if exif_dict is None:
+        if 'exif' in img.info:
+            exif_dict = piexif.load(img.info['exif'])
+        else:
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+    # ---- simple tags: only the keys we were given
+    for name, (ifd, tag, kind) in SIMPLE_FIELDS.items():
+        if name not in fields:
+            continue
+        value = fields[name]
+        if value is None:
+            exif_dict[ifd].pop(tag, None)
+            continue
+        if kind == "str":
+            exif_dict[ifd][tag] = str(value).encode("utf-8")
+        elif kind == "rational":
+            exif_dict[ifd][tag] = _to_fraction(float(value))
+        else:
+            exif_dict[ifd][tag] = int(value)
+
+    # ---- GPS: lat/lon carry a Ref tag, altitude is independent
+    if fields.get("clear_gps"):
+        exif_dict["GPS"] = {}            # verified safe: other IFDs untouched
     else:
-        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+        gps = exif_dict.setdefault("GPS", {})
+        for name, tag, ref_tag, pos_ref, neg_ref in (
+                ("latitude",  piexif.GPSIFD.GPSLatitude,
+                 piexif.GPSIFD.GPSLatitudeRef,  "N", "S"),
+                ("longitude", piexif.GPSIFD.GPSLongitude,
+                 piexif.GPSIFD.GPSLongitudeRef, "E", "W")):
+            if name not in fields:
+                continue
+            value = fields[name]
+            if value is None:
+                gps.pop(tag, None)
+                gps.pop(ref_tag, None)
+            else:
+                v = float(value)
+                gps[tag] = to_degrees(v)
+                gps[ref_tag] = pos_ref if v >= 0 else neg_ref
 
-    # ---- GPS
-    exif_dict['GPS'][piexif.GPSIFD.GPSLongitude]  = to_degrees(longitude)
-    exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = "E" if longitude >= 0 else "W"
-    exif_dict['GPS'][piexif.GPSIFD.GPSLatitude]   = to_degrees(latitude)
-    exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = "N" if latitude >= 0 else "S"
-    exif_dict['GPS'][piexif.GPSIFD.GPSAltitude]   = _to_fraction(altitude) if altitude else (0, 1)
-    exif_dict['GPS'][piexif.GPSIFD.GPSAltitudeRef] = 0 if altitude >= 0 else 1
-
-    # ---- capture params
-    exif_dict['Exif'][piexif.ExifIFD.FocalLength]      = _to_fraction(focal_length)
-    exif_dict['Exif'][piexif.ExifIFD.FNumber]          = _to_fraction(aperture)
-    exif_dict['Exif'][piexif.ExifIFD.ISOSpeedRatings]  = iso
-    exif_dict['0th'][piexif.ImageIFD.Make]             = make.encode("utf-8")
-    exif_dict['0th'][piexif.ImageIFD.Model]            = model.encode("utf-8")
-    exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = shot_date.encode("utf-8")
+        if "altitude" in fields:
+            value = fields["altitude"]
+            if value is None:
+                gps.pop(piexif.GPSIFD.GPSAltitude, None)
+                gps.pop(piexif.GPSIFD.GPSAltitudeRef, None)
+            else:
+                alt = float(value)
+                gps[piexif.GPSIFD.GPSAltitude] = _to_fraction(alt) if alt else (0, 1)
+                gps[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
 
     exif_bytes = piexif.dump(exif_dict)
     ext = os.path.splitext(output_path)[1].lower()
@@ -166,6 +235,7 @@ def apply_exif(img, output_path, *, longitude, latitude, altitude,
     if ext in (".jpg", ".jpeg"):
         save_kwargs["quality"] = 100
     img.save(output_path, **save_kwargs)
+    return exif_dict
 
 
 def read_exif_info(img_path):
