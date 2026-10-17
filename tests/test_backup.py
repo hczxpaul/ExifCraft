@@ -392,3 +392,73 @@ class TestPurgeOrphans:
             fp.write("mine")
         assert ExifCraft.BackupManager.purge_orphans(str(tmp_path)) == 0
         assert os.path.exists(rec.backup)              # still referenced
+
+
+class TestFileTickBoxes:
+    """Writes must only touch the files the user ticked."""
+
+    def test_all_files_ticked_by_default(self, app, jpeg_factory):
+        app.input_files = [str(jpeg_factory(f"t{i}.jpg")) for i in range(3)]
+        app._refresh_list()
+        assert app.file_checked == [True, True, True]
+        assert app.checked_files() == app.input_files
+
+    def test_unticked_files_are_excluded(self, app, jpeg_factory):
+        app.input_files = [str(jpeg_factory(f"u{i}.jpg")) for i in range(3)]
+        app._refresh_list()
+        app.file_checked[1] = False
+        picked = app.checked_files()
+        assert len(picked) == 2
+        assert app.input_files[1] not in picked
+
+    def test_row_renders_tick_square(self, app, jpeg_factory):
+        app.input_files = [str(jpeg_factory("r1.jpg"))]
+        app._refresh_list()
+        assert app.file_list.get(0).startswith("■")
+        app.file_checked[0] = False
+        app._render_file_row(0)
+        assert app.file_list.get(0).startswith("□")
+
+    def test_toggle_flips_and_refreshes_footer(self, app, jpeg_factory):
+        app.input_files = [str(jpeg_factory(f"f{i}.jpg")) for i in range(2)]
+        app._refresh_list()
+        assert "全部已勾选" in app.list_count_lbl.cget("text")
+        app._toggle_file_tick(0)
+        assert app.file_checked == [False, True]
+        assert "已勾选 1" in app.list_count_lbl.cget("text")
+
+    def test_tick_all_and_untick_all(self, app, jpeg_factory):
+        app.input_files = [str(jpeg_factory(f"a{i}.jpg")) for i in range(3)]
+        app._refresh_list()
+        app._tick_all_files(False)
+        assert app.checked_files() == []
+        app._tick_all_files(True)
+        assert len(app.checked_files()) == 3
+
+    def test_write_only_touches_ticked(self, app, mod, no_dialogs, jpeg_factory):
+        paths = [str(jpeg_factory(f"w{i}.jpg", gps=True)) for i in range(3)]
+        app.input_files = paths
+        app._refresh_list()
+        untouched_before = open(paths[1], "rb").read()
+        app.file_checked[1] = False            # skip the middle file
+
+        # what _write_async would hand to the worker
+        app._write_worker(app.checked_files(), "", {"iso": "800"}, overwrite=True)
+        app.root.update()
+
+        assert open(paths[1], "rb").read() == untouched_before   # never written
+        assert mod.read_exif_info(paths[0])["iso"] == "800"
+        assert mod.read_exif_info(paths[2])["iso"] == "800"
+
+    def test_csv_export_only_ticked(self, app, mod, no_dialogs, monkeypatch,
+                                    jpeg_factory, tmp_path):
+        app.input_files = [str(jpeg_factory(f"c{i}.jpg")) for i in range(3)]
+        app._refresh_list()
+        app.file_checked[2] = False
+        target = tmp_path / "out.csv"
+        monkeypatch.setattr(mod.filedialog, "asksaveasfilename",
+                            lambda *a, **k: str(target))
+        app._export_csv()
+        rows = open(target, encoding="utf-8").read().strip().splitlines()
+        assert len(rows) == 3                   # header + 2 ticked files
+        assert "c2.jpg" not in "".join(rows)

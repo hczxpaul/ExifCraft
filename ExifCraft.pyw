@@ -814,6 +814,8 @@ class ExifCraft:
 
         # state
         self.input_files: list[str] = []
+        # per-file tick box: writes only touch the files the user ticked
+        self.file_checked: list[bool] = []
         self.worker: threading.Thread | None = None
 
         # preview state: LRU cache (path -> PhotoImage) + the currently shown
@@ -1118,9 +1120,12 @@ class ExifCraft:
                            style="Vertical.TScrollbar", command=self.file_list.yview)
         sb.pack(side="right", fill="y")
         self.file_list.configure(yscrollcommand=sb.set)
+        # click a row → flip its tick box; arrows/space stay keyboard-usable
+        self.file_list.bind("<ButtonRelease-1>", self._on_list_click)
+        self.file_list.bind("<space>", self._on_list_space)
         self.file_list.bind("<<ListboxSelect>>", self._schedule_preview)
 
-        # list footer
+        # list footer: tick-all / untick-all / clear
         list_footer = ttk.Frame(src_card.body, style="CardInner.TFrame")
         list_footer.pack(fill="x", pady=(4, 0))
         self.list_count_lbl = ttk.Label(list_footer, text="0 files",
@@ -1128,6 +1133,10 @@ class ExifCraft:
         self.list_count_lbl.pack(side="left")
         ttk.Button(list_footer, text="Clear", style="Subtle.TButton",
                    command=self._clear_files).pack(side="right")
+        ttk.Button(list_footer, text="全不选", style="Subtle.TButton",
+                   command=lambda: self._tick_all_files(False)).pack(side="right")
+        ttk.Button(list_footer, text="全选", style="Subtle.TButton",
+                   command=lambda: self._tick_all_files(True)).pack(side="right")
 
         # options row
         opt_row = ttk.Frame(src_card.body, style="CardInner.TFrame")
@@ -1194,22 +1203,15 @@ class ExifCraft:
         # DateEntry has no "empty" state (clearing it snaps back to today), so
         # the whole date row is gated by a toggle chip instead of by its text.
         # Each widget gets its own grid column — label and picker overlapped before.
-        date_chip = tk.Label(row, text="☑ Date", font=Theme.FONT_BOLD,
-                             bg=Theme.SURFACE, fg=Theme.PRIMARY_H,
-                             cursor="hand2", padx=2)
+        date_chip, _render_date_chip = self._make_toggle_chip(
+            row, "Date",
+            lambda: self.date_flag.get(),
+            lambda v: self.date_flag.set(v))
         date_chip.grid(row=0, column=0, sticky="w")
 
-        def _render_date_chip(*_):
-            if self.date_flag.get():
-                date_chip.configure(text="☑ Date", fg=Theme.PRIMARY_H, bg=Theme.PRIMARY_S)
-            else:
-                date_chip.configure(text="☐ Date", fg=Theme.TEXT_3, bg=Theme.SURFACE)
-
-        def _toggle_date(_e=None):
-            self.date_flag.set(not self.date_flag.get())
-
-        date_chip.bind("<Button-1>", _toggle_date)
-        self.date_flag.trace_add("write", _render_date_chip)
+        def _on_date_change(*_):
+            _render_date_chip()
+        self.date_flag.trace_add("write", _on_date_change)
 
         date_clear_btn = tk.Button(row, text="✕", width=2, bd=0, relief="flat",
                                    bg=Theme.SURFACE, fg=Theme.TEXT_3, cursor="hand2",
@@ -1381,13 +1383,75 @@ class ExifCraft:
             ttk.Label(frame, text=hint, style="Hint.TLabel").pack(anchor="w", pady=(2, 0))
         return frame
 
+    def _make_toggle_chip(self, parent, label: str, get_state, set_state):
+        """Solid-square toggle: ■ label (on) / □ label (off).
+
+        Built from two labels so the square and the text carry different
+        colours — state is encoded by shape AND colour AND text weight, never
+        by colour alone (accessibility).
+
+        Args:
+            parent: container widget.
+            label: caption shown next to the square.
+            get_state: () -> bool, reads the current state.
+            set_state: (bool) -> None, applies a new state.
+
+        Returns:
+            (frame, render) — frame is already packed-free; call render()
+            whenever the underlying state changes.
+        """
+        chip = tk.Frame(parent, bg=Theme.SURFACE, cursor="hand2")
+        mark = tk.Label(chip, text="□", font=(Theme.FONT[0], Theme.FONT[1] + 2),
+                        bg=Theme.SURFACE, fg=Theme.TEXT_3)
+        mark.pack(side="left", padx=(7, 5))
+        text = tk.Label(chip, text=label, font=Theme.FONT_BOLD,
+                        bg=Theme.SURFACE, fg=Theme.TEXT_3)
+        text.pack(side="left", padx=(0, 7), pady=5)      # roomy click target
+
+        def render(*_):
+            on = bool(get_state())
+            mark.configure(text="■" if on else "□",
+                           fg=Theme.PRIMARY if on else Theme.TEXT_3)
+            text.configure(fg=Theme.TEXT if on else Theme.TEXT_3)
+            chip.configure(bg=chip._hover_bg if getattr(chip, "_hover", False)
+                           else Theme.SURFACE)
+            mark.configure(bg=chip.cget("bg"))
+            text.configure(bg=chip.cget("bg"))
+
+        def _enter(_e=None):
+            chip._hover = True
+            chip._hover_bg = Theme.PRIMARY_S if get_state() else Theme.SURFACE_2
+            render()
+
+        def _leave(_e=None):
+            chip._hover = False
+            render()
+
+        def _press(_e=None):
+            chip._hover_bg = Theme.BORDER_FOCUS
+            chip._hover = True
+            render()
+
+        def _release(_e=None):
+            set_state(not get_state())
+            _enter()                                     # re-evaluate hover colour
+
+        for w in (chip, mark, text):
+            w.bind("<Button-1>", _release)
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+            w.bind("<ButtonPress-1>", _press)
+
+        chip._hover = False
+        chip._hover_bg = Theme.SURFACE
+        return chip, render
+
     def _make_field_chip(self, parent, field: str, label: str) -> tk.Label:
-        """A big, unmissable toggle: ☑ Field / ☐ Field with colour coding."""
-        chip = tk.Label(parent, text=f"☐ {label}", font=Theme.FONT_BOLD,
-                        bg=Theme.SURFACE, fg=Theme.TEXT_3, cursor="hand2", padx=2)
-        chip.bind("<Button-1>", lambda e: self.write_flags[field].set(
-            not self.write_flags[field].get()))
-        self._toggle_chips[field] = (chip, label)
+        chip, render = self._make_toggle_chip(
+            parent, label,
+            lambda: self.write_flags[field].get(),
+            lambda v: self.write_flags[field].set(v))
+        self._toggle_chips[field] = (chip, label, render)
         return chip
 
     def _refresh_fields_ui(self) -> None:
@@ -1400,13 +1464,8 @@ class ExifCraft:
         for name, entry in self._field_entries.items():
             active = self.write_flags[name].get() and not self.clear_flags[name].get()
             entry.state(["!disabled"] if active else ["disabled"])
-        for name, (chip, label) in self._toggle_chips.items():
-            if self.write_flags[name].get():
-                chip.configure(text=f"☑ {label}", fg=Theme.PRIMARY_H,
-                               bg=Theme.PRIMARY_S)
-            else:
-                chip.configure(text=f"☐ {label}", fg=Theme.TEXT_3,
-                               bg=Theme.SURFACE)
+        for name, (_chip, _label, render) in self._toggle_chips.items():
+            render()
         for name, btn in self._clear_btns.items():
             btn.configure(text="↺" if self.clear_flags[name].get() else "✕",
                           fg=Theme.ERROR if self.clear_flags[name].get()
@@ -1621,19 +1680,76 @@ class ExifCraft:
         self._preview_state("empty", "选择文件以预览", "")
         self._log("File list cleared.", "muted")
 
+    # ------------------------------------------------------------------
+    #  File tick boxes
+    # ------------------------------------------------------------------
+    TICK_ON, TICK_OFF = "■", "□"                 # solid square = will be written
+
+    def _render_file_row(self, idx: int) -> None:
+        """Redraw one row: tick square + filename, dimmed when unticked."""
+        name = os.path.basename(self.input_files[idx])
+        on = self.file_checked[idx]
+        self.file_list.delete(idx)
+        self.file_list.insert(idx, f"{self.TICK_ON if on else self.TICK_OFF}  {name}")
+        self.file_list.itemconfigure(
+            idx, fg=Theme.TEXT if on else Theme.TEXT_3)
+
     def _refresh_list(self):
         self.file_list.delete(0, "end")
-        for f in self.input_files:
-            self.file_list.insert("end", os.path.basename(f))
-        n = len(self.input_files)
-        self.list_count_lbl.configure(
-            text=f"{n} file{'s' if n != 1 else ''} loaded"
-        )
-        if n:                                   # auto-select first → fires preview
+        self.file_checked = [True] * len(self.input_files)   # ticked by default
+        for i, f in enumerate(self.input_files):
+            self.file_list.insert("end", f"{self.TICK_ON}  {os.path.basename(f)}")
+            self.file_list.itemconfigure(i, fg=Theme.TEXT)
+        self._refresh_list_footer()
+        if self.input_files:            # auto-select first → fires preview
             self.file_list.selection_set(0)
             # NB: Tk does not guarantee <<ListboxSelect>> for a programmatic
             # selection_set, so schedule the preview explicitly here.
             self._schedule_preview()
+
+    def _refresh_list_footer(self) -> None:
+        n = len(self.input_files)
+        picked = sum(1 for c in self.file_checked if c)
+        if picked == n:
+            text = f"{n} file{'s' if n != 1 else ''}  ·  全部已勾选"
+        else:
+            text = f"{n} file{'s' if n != 1 else ''}  ·  已勾选 {picked}"
+        self.list_count_lbl.configure(text=text)
+
+    def _on_list_click(self, event):
+        """Mouse: tick the row under the cursor."""
+        self._toggle_file_tick(self.file_list.nearest(event.y))
+
+    def _on_list_space(self, _event=None):
+        """Keyboard: tick the currently highlighted row.
+
+        Distinct from the mouse path on purpose — a key event also carries
+        mouse coordinates, and using those here would tick the wrong row.
+        """
+        sel = self.file_list.curselection()
+        self._toggle_file_tick(sel[0] if sel else None)
+
+    def _toggle_file_tick(self, idx: int | None) -> None:
+        """Flip the tick box of row *idx* and keep row/preview in sync."""
+        if idx is None or not (0 <= idx < len(self.input_files)):
+            return
+        self.file_checked[idx] = not self.file_checked[idx]
+        self._render_file_row(idx)
+        self._refresh_list_footer()
+        self.file_list.selection_clear(0, "end")
+        self.file_list.selection_set(idx)
+        self._schedule_preview()             # keep the preview in sync
+
+    def _tick_all_files(self, value: bool):
+        self.file_checked = [value] * len(self.input_files)
+        for i in range(len(self.input_files)):
+            self._render_file_row(i)
+        self._refresh_list_footer()
+        self._log(f"{'勾选' if value else '取消勾选'}全部文件。", "muted")
+
+    def checked_files(self) -> list[str]:
+        """Files the user actually ticked — the only ones a write touches."""
+        return [f for f, c in zip(self.input_files, self.file_checked) if c]
 
     # ------------------------------------------------------------------
     #  Read existing EXIF
@@ -1760,6 +1876,12 @@ class ExifCraft:
             messagebox.showerror(self.APP_NAME, "Pick at least one image first.")
             return
 
+        files = self.checked_files()
+        if not files:
+            messagebox.showerror(self.APP_NAME,
+                                 "没有勾选任何文件。\n请至少勾选一个文件再写入。")
+            return
+
         fields = self._collect_params()
         ok, errs = Validator.check_fields(fields)
         if not ok:
@@ -1768,21 +1890,23 @@ class ExifCraft:
             return
         self._set_error("")
 
-        out_dir = self.out_var.get().strip() or os.path.dirname(self.input_files[0])
+        out_dir = self.out_var.get().strip() or os.path.dirname(files[0])
         os.makedirs(out_dir, exist_ok=True)
         overwrite = self.overwrite_var.get()
 
         self.progress["value"] = 0
-        self.progress["maximum"] = len(self.input_files)
-        self.progress_text.configure(text=f"0 / {len(self.input_files)}")
+        self.progress["maximum"] = len(files)
+        self.progress_text.configure(text=f"0 / {len(files)}")
         self._set_status("Writing…")
         names = ", ".join(k for k in fields if k != "clear_gps")
-        self._log(f"开始写入 {len(self.input_files)} 个文件"
-                  f"（字段：{names or '仅清除 GPS'}）…", "muted")
+        skipped = len(self.input_files) - len(files)
+        self._log(f"开始写入勾选项 {len(files)}/{len(self.input_files)} 个文件"
+                  f"（字段：{names or '仅清除 GPS'}）…"
+                  + (f"，跳过未勾选 {skipped} 个" if skipped else ""), "muted")
 
         self.worker = threading.Thread(
             target=self._write_worker,
-            args=(list(self.input_files), out_dir, fields, overwrite),
+            args=(files, out_dir, fields, overwrite),
             daemon=True,
         )
         self.worker.start()
@@ -1911,8 +2035,10 @@ class ExifCraft:
     #  CSV export
     # ------------------------------------------------------------------
     def _export_csv(self):
-        if not self.input_files:
-            messagebox.showinfo(self.APP_NAME, "No files loaded.")
+        files = self.checked_files()
+        if not files:
+            messagebox.showinfo(self.APP_NAME,
+                                "没有勾选任何文件。\n请先勾选要导出的文件。")
             return
         target = filedialog.asksaveasfilename(
             defaultextension=".csv",
@@ -1922,14 +2048,14 @@ class ExifCraft:
         if not target:
             return
         rows = []
-        for f in self.input_files:
+        for f in files:                     # only what the user ticked
             info = read_exif_info(f)
             rows.append({"file": os.path.basename(f), **{k: v for k, v in info.items()}})
         with open(target, "w", newline="", encoding="utf-8") as fp:
             w = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
             w.writeheader()
             w.writerows(rows)
-        self._log(f"Exported CSV: {target}", "ok")
+        self._log(f"Exported CSV: {target}（{len(rows)} 个勾选项）", "ok")
 
     # ------------------------------------------------------------------
     #  Lifecycle

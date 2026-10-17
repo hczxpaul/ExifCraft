@@ -222,7 +222,8 @@ class TestThreeStateUI:
 class TestReadBackFillsEverything:
     """Regression red line: read a file, write it back → same as a full write."""
 
-    def test_read_then_write_preserves_all_fields(self, app, mod, jpeg_factory, tmp_path):
+    def test_read_then_write_preserves_all_fields(self, app, mod, no_dialogs,
+                                                  jpeg_factory, tmp_path):
         src = str(jpeg_factory("rt.jpg"))
         seeded = tmp_path / "seeded.jpg"
         write_fields(mod, src, str(seeded), FULL)
