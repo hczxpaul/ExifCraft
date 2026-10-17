@@ -95,9 +95,12 @@ class Theme:
 #  EXIF helpers
 # =====================================================================
 def to_degrees(value: float):
-    d = int(value)
-    m = int((value - d) * 60)
-    s = (value - d - m / 60) * 3600
+    # Standard DMS: parts are always non-negative; the sign lives in the
+    # N/S or E/W Ref tag. Keeping negative parts breaks third-party readers.
+    v = abs(value)
+    d = int(v)
+    m = int((v - d) * 60)
+    s = (v - d - m / 60) * 3600
     return [(d, 1), (m, 1), _to_fraction(s)]
 
 
@@ -185,6 +188,9 @@ def read_exif_info(img_path):
         d, m, s = dms
         val = d[0]/d[1] + m[0]/(m[1]*60) + s[0]/(s[1]*3600)
         ref = gps.get(ref_tag, default_ref)
+        # piexif returns ASCII tags (e.g. "S"/"W") as bytes — decode before comparing
+        if isinstance(ref, (bytes, bytearray)):
+            ref = ref.decode("ascii", "ignore")
         if ref in ("S", "W"):
             val = -val
         return f"{val:.6f}"
