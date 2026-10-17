@@ -1,8 +1,15 @@
+# ---- runtime ----
 piexif==1.1.3
-Pillow==10.2.0
-tkintermapview==1.30
-tkcalendar==1.6.1
+# 10.2.0 has no prebuilt wheel for Python 3.13 (source build fails);
+# 10.2 – 12.x are verified working, EXIF/PNG behaviour is unchanged across them.
+Pillow>=10.2,<13
+tkintermapview==1.30    # optional: map picker for GPS coordinates
+tkcalendar==1.6.1       # optional: calendar date picker
 
 # Optional — only needed to regenerate ExifCraft.ico / ExifCraft.png
 # from app_icon.svg via `python make_icon.py`. Not required to run the app.
 PyMuPDF==1.26.5
+
+# ---- development / packaging ----
+pytest>=8               # run: .venv\Scripts\python -m pytest tests/ -q
+pyinstaller>=6          # run: python build.py
