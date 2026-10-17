@@ -27,6 +27,41 @@ def mod():
     return ExifCraft
 
 
+# ---------------------------------------------------------------------------
+#  GUI fixtures — one Tk root for the whole session (Windows cannot create
+#  and destroy many roots), plus an app instance that also redirects the
+#  backup journal into the test's temp dir.
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="session")
+def tk_root():
+    import tkinter as tk
+    root = tk.Tk()
+    yield root
+    root.destroy()
+
+
+@pytest.fixture
+def no_dialogs(mod, monkeypatch):
+    """Block modal dialogs — they would wait for a human click in tests."""
+    for name in ("showinfo", "showerror", "showwarning",
+                 "askyesno", "askokcancel", "askyesnocancel"):
+        monkeypatch.setattr(mod.messagebox, name, lambda *a, **k: True)
+
+
+@pytest.fixture
+def app(mod, tk_root, monkeypatch, tmp_path):
+    monkeypatch.setattr(mod, "APP_DIR", str(tmp_path), raising=True)
+    a = mod.ExifCraft(tk_root)
+    yield a
+    if a._preview_after_id:
+        try:
+            tk_root.after_cancel(a._preview_after_id)
+        except Exception:
+            pass
+    for child in tk_root.winfo_children():
+        child.destroy()
+
+
 def _base_exif(*, gps: bool, orientation: int | None) -> dict:
     exif = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
     if orientation is not None:

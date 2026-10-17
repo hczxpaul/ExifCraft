@@ -9,8 +9,14 @@ License: MIT
 import os
 import sys
 import csv
+import json
+import uuid
+import shutil
+import ctypes
+import tempfile
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass, asdict
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from fractions import Fraction
@@ -118,7 +124,20 @@ def set_exif_data(img_path, output_path, *, longitude, latitude, altitude,
         img = Image.open(img_path)
     except UnidentifiedImageError:
         raise ValueError(f"Unrecognized image: {os.path.basename(img_path)}")
+    apply_exif(img, output_path, longitude=longitude, latitude=latitude,
+               altitude=altitude, focal_length=focal_length, aperture=aperture,
+               iso=iso, make=make, model=model, shot_date=shot_date)
 
+
+def apply_exif(img, output_path, *, longitude, latitude, altitude,
+               focal_length, aperture, iso,
+               make, model, shot_date):
+    """Write EXIF from an already-opened PIL image to *output_path*.
+
+    Split out of set_exif_data so callers can load an image into memory first:
+    overwrite mode renames the source away before saving, so re-opening the
+    path inside would fail.
+    """
     if 'exif' in img.info:
         exif_dict = piexif.load(img.info['exif'])
     else:
@@ -255,6 +274,329 @@ class Validator:
 
 
 # =====================================================================
+#  Backup / rollback — session write journal
+# =====================================================================
+BAK_PREFIX = "._ExifCraft_bak_"     # dot prefix: hidden on Unix, ignored by image scanners
+BAK_SUFFIX = ".exifbak"             # non-image extension: never picked up by photo tools
+
+
+@dataclass
+class Rec:
+    """One journalled write operation."""
+    src: str                 # source file
+    dst: str                 # destination (copy mode: new file; overwrite: same path)
+    backup: str | None       # backup path (overwrite mode only)
+    mode: str                # "copy" | "overwrite"
+    state: str = "pending"   # pending → done / failed
+    mtime: float = 0.0       # src fingerprint before the write (audit trail)
+    size: int = 0
+    written_mtime: float = 0.0   # dst fingerprint right after OUR write
+    written_size: int = 0        # ← what changed_since() compares against
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d: dict) -> "Rec":
+        known = {f for f in Rec.__dataclass_fields__}
+        return Rec(**{k: v for k, v in d.items() if k in known})
+
+
+def set_hidden(path: str) -> None:
+    """Mark *path* hidden on Windows; a no-op elsewhere (dot-prefix suffices)."""
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2)  # FILE_ATTRIBUTE_HIDDEN
+        except Exception:
+            pass
+
+
+class BackupManager:
+    """Session-scoped write journal with backup / rollback / cleanup.
+
+    Design: every write is journalled to JSON *before* any file is touched.
+    A crash mid-write is recovered at next startup by replaying pending
+    records. Backups live next to the originals as hidden non-image files so
+    a rollback never needs to copy data across a slow network drive — rename
+    is a metadata operation.
+    """
+
+    def __init__(self, app_dir: str, session_id: str | None = None):
+        self.sid = session_id or uuid.uuid4().hex[:8]
+        self.dir = self._pick_dir(app_dir)
+        self.path = os.path.join(self.dir, f"{self.sid}.json")
+        self.recs: list[Rec] = []
+        self._flush()
+
+    # ------------------------------------------------------------------
+    #  Storage location — prefer the app dir, fall back to %TEMP%
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pick_dir(app_dir: str) -> str:
+        for base in (app_dir, tempfile.gettempdir()):
+            d = os.path.join(base, ".exifcraft", "sessions")
+            try:
+                os.makedirs(d, exist_ok=True)
+                probe = os.path.join(d, ".probe")
+                with open(probe, "w", encoding="utf-8") as fp:
+                    fp.write("ok")
+                os.remove(probe)
+                return d
+            except OSError:
+                continue
+        raise RuntimeError("no writable location for ExifCraft session data")
+
+    # ------------------------------------------------------------------
+    #  Journal
+    # ------------------------------------------------------------------
+    def _flush(self) -> None:
+        """Persist the journal. Best-effort: disk state alone still recovers."""
+        payload = {
+            "session": self.sid,
+            "updated": datetime.now().isoformat(timespec="seconds"),
+            "records": [r.as_dict() for r in self.recs],
+        }
+        try:
+            with open(self.path, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    #  Naming
+    # ------------------------------------------------------------------
+    def backup_name(self, src: str) -> str:
+        base = os.path.basename(src)
+        return os.path.join(os.path.dirname(src),
+                            f"{BAK_PREFIX}{self.sid}_{base}{BAK_SUFFIX}")
+
+    # ------------------------------------------------------------------
+    #  Lifecycle
+    # ------------------------------------------------------------------
+    def begin(self, src: str, dst: str, mode: str) -> Rec:
+        """Journal intent *before* touching files. Returns the record."""
+        st = os.stat(src)
+        rec = Rec(
+            src=src, dst=dst,
+            backup=self.backup_name(src) if mode == "overwrite" else None,
+            mode=mode, mtime=st.st_mtime, size=st.st_size,
+        )
+        self.recs.append(rec)
+        self._register_dirs(os.path.dirname(src), os.path.dirname(dst))
+        self._flush()
+        return rec
+
+    def _register_dirs(self, *dirs: str) -> None:
+        """Remember every directory we touched, so a later startup can scan
+        them for orphaned backups even if a journal was lost."""
+        index_path = os.path.join(self.dir, "_dirs.json")
+        known: set[str] = set()
+        try:
+            with open(index_path, encoding="utf-8") as fp:
+                known = set(json.load(fp))
+        except (OSError, json.JSONDecodeError):
+            pass
+        known.update(os.path.abspath(d) for d in dirs if d)
+        try:
+            with open(index_path, "w", encoding="utf-8") as fp:
+                json.dump(sorted(known), fp)
+        except OSError:
+            pass
+
+    def commit(self, rec: Rec) -> None:
+        """Mark the write done and fingerprint the file *we* produced.
+
+        The post-write fingerprint is what changed_since() compares against —
+        comparing against the pre-write one would flag every successful write
+        as "externally modified" and make rollback a no-op.
+        """
+        try:
+            st = os.stat(rec.dst)
+            rec.written_mtime, rec.written_size = st.st_mtime, st.st_size
+        except OSError:
+            pass
+        rec.state = "done"
+        self._flush()
+
+    def fail(self, rec: Rec) -> None:
+        rec.state = "failed"
+        self._flush()
+
+    # ------------------------------------------------------------------
+    #  Introspection (status bar / dialogs)
+    # ------------------------------------------------------------------
+    def live_backups(self) -> list[Rec]:
+        return [r for r in self.recs if r.backup and os.path.exists(r.backup)]
+
+    def backup_count(self) -> int:
+        return len(self.live_backups())
+
+    def backup_bytes(self) -> int:
+        return sum(os.path.getsize(r.backup) for r in self.live_backups())
+
+    def changed_since(self, rec: Rec) -> bool:
+        """True if dst was modified by somebody else after we wrote it.
+
+        A never-committed record (written_* unset) counts as unchanged: that
+        is an interrupted write, which rollback is supposed to undo.
+        """
+        if not rec.written_mtime:
+            return False
+        try:
+            st = os.stat(rec.dst)
+        except OSError:
+            return False
+        return (abs(st.st_mtime - rec.written_mtime) > 1e-6
+                or st.st_size != rec.written_size)
+
+    # ------------------------------------------------------------------
+    #  Safe write — rename-based backup (fast on network drives)
+    # ------------------------------------------------------------------
+    def safe_write(self, rec: Rec, save_fn) -> None:
+        """Execute a journalled write with backup protection.
+
+        *rec* must come from begin(). *save_fn(path)* performs the actual
+        save (kept as a callback so this class stays format-agnostic).
+
+        Overwrite mode: the image is loaded into memory first, then the
+        original is renamed to the backup path (a metadata operation even on
+        remote HDDs), then the new content is written to the original path.
+        If the rename fails (permissions, file locked), fall back to a full
+        copy. Copy mode: nothing to back up — the original is never touched.
+
+        Any exception propagates after the journal is marked failed, so the
+        caller can continue with the next file.
+        """
+        if rec.mode == "overwrite" and rec.backup:
+            try:
+                os.rename(rec.src, rec.backup)       # fast path: metadata only
+                set_hidden(rec.backup)
+            except OSError:
+                shutil.copy2(rec.src, rec.backup)    # slow path: full copy
+                set_hidden(rec.backup)
+        try:
+            save_fn(rec.dst)
+        except Exception:
+            self.fail(rec)
+            raise
+
+    # ------------------------------------------------------------------
+    #  Rollback & cleanup
+    # ------------------------------------------------------------------
+    def rollback(self, recs: list[Rec] | None = None) -> tuple[int, list[str]]:
+        """Undo journalled writes. Returns (restored_count, skipped_paths).
+
+        Skipped = files whose fingerprint changed after the write (somebody
+        else edited them) — never silently overwrite foreign changes.
+        """
+        recs = self.recs if recs is None else recs
+        target = {id(r) for r in recs}          # identity, not equality:
+        done, skipped = 0, []                   # dataclass __eq__ would alias twins
+        keep: list[Rec] = []
+        for r in self.recs:
+            if id(r) not in target:
+                keep.append(r)
+                continue
+            try:
+                if r.mode == "overwrite" and r.backup and os.path.exists(r.backup):
+                    if self.changed_since(r):
+                        skipped.append(r.dst)
+                        keep.append(r)          # backup survives, keep the record
+                        continue
+                    os.replace(r.backup, r.dst)  # atomic restore
+                    done += 1
+                elif r.mode == "copy" and os.path.exists(r.dst):
+                    os.remove(r.dst)             # remove the *_exif copy
+                    done += 1
+            except OSError:
+                skipped.append(r.dst)
+                keep.append(r)
+        self.recs = keep
+        self._flush()
+        return done, skipped
+
+    def cleanup(self) -> None:
+        """Delete every backup we still hold + the journal itself."""
+        for r in self.recs:
+            if r.backup and os.path.exists(r.backup):
+                try:
+                    os.remove(r.backup)
+                except OSError:
+                    pass
+        self.recs = []
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    #  Crash recovery — module-level, run at startup
+    # ------------------------------------------------------------------
+    @staticmethod
+    def recover_sessions(app_dir: str) -> tuple[int, int]:
+        """Replay every journalled session on disk.
+
+        Returns (restored, orphans): files restored from pending writes and
+        leftover backup files that no journal references.
+
+        Recovery rules per pending record:
+          * backup exists, dst gone      → rename never finished: restore
+          * dst exists (save happened)   → keep dst, journal just missed commit
+        """
+        sessions_dir = BackupManager._pick_dir(app_dir)
+        journals = [f for f in os.listdir(sessions_dir)
+                    if f.endswith(".json") and not f.startswith("_")]
+        # NB: no early return when journals are empty — a fully lost journal is
+        # exactly the orphan scenario, and the scan itself is free when
+        # _dirs.json does not exist (no directory was ever registered).
+
+        restored, managed = 0, set()
+        for name in journals:
+            try:
+                with open(os.path.join(sessions_dir, name), encoding="utf-8") as fp:
+                    data = json.load(fp)
+            except (OSError, json.JSONDecodeError):
+                continue
+            for d in data.get("records", []):
+                try:
+                    r = Rec.from_dict(d)
+                except TypeError:
+                    continue
+                if r.backup:
+                    managed.add(os.path.abspath(r.backup))
+                if r.state != "pending":
+                    continue
+                if r.backup and os.path.exists(r.backup) and not os.path.exists(r.dst):
+                    try:
+                        os.replace(r.backup, r.dst)   # interrupted rename → restore
+                        restored += 1
+                    except OSError:
+                        pass
+                # else: save completed but commit missed — disk wins, keep dst
+            try:
+                os.remove(os.path.join(sessions_dir, name))   # session closed
+            except OSError:
+                pass
+
+        # orphan scan: every directory we ever touched, minus managed backups
+        scan_dirs: set[str] = set()
+        try:
+            with open(os.path.join(sessions_dir, "_dirs.json"), encoding="utf-8") as fp:
+                scan_dirs = set(json.load(fp))
+        except (OSError, json.JSONDecodeError):
+            pass
+        orphans = 0
+        for d in scan_dirs:
+            if not os.path.isdir(d):
+                continue
+            for f in os.listdir(d):
+                if f.startswith(BAK_PREFIX) and f.endswith(BAK_SUFFIX):
+                    if os.path.abspath(os.path.join(d, f)) not in managed:
+                        orphans += 1
+        return restored, orphans
+
+
+# =====================================================================
 #  UI building blocks
 # =====================================================================
 class Card(tk.Frame):
@@ -303,6 +645,15 @@ class ExifCraft:
         self._preview_photo: ImageTk.PhotoImage | None = None
         self._preview_after_id: str | None = None
 
+        # write journal — drives rollback. None only if no writable location
+        # exists; writes then still work, just without rollback.
+        self._bm_error = ""
+        try:
+            self.bm: BackupManager | None = BackupManager(APP_DIR)
+        except Exception as e:
+            self.bm = None
+            self._bm_error = str(e)
+
         # string vars (defaults empty — let the user fill in)
         self.src_var   = tk.StringVar()
         self.out_var   = tk.StringVar()
@@ -325,6 +676,8 @@ class ExifCraft:
         self._setup_window()          # needs measured widget sizes → after _build
         self._set_window_icon()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.bm is None:
+            self._log(f"备份功能不可用（无可用写入位置）：{self._bm_error}", "warn")
 
     # ------------------------------------------------------------------
     #  Window icon
@@ -1078,15 +1431,38 @@ class ExifCraft:
             else:
                 dst = os.path.join(out_dir, f"{name}_exif{ext}")
 
+            # Open (and fully decode, in overwrite mode) BEFORE any rename:
+            # safe_write moves the source away, so reading it afterwards fails.
             try:
-                set_exif_data(
-                    src, dst,
-                    longitude=lon, latitude=lat, altitude=alt,
-                    focal_length=fl, aperture=ap, iso=iso,
-                    make=params["make"], model=params["model"],
-                    shot_date=params["date"],
-                    overwrite=overwrite,
-                )
+                img = Image.open(src)
+                if overwrite:
+                    img.load()
+            except Exception as e:
+                self.root.after(0, lambda b=base, m=str(e):
+                                self._log(f"{b} failed: {m}", "err"))
+                continue
+
+            def save_to(path, _img=img):
+                apply_exif(_img, path,
+                           longitude=lon, latitude=lat, altitude=alt,
+                           focal_length=fl, aperture=ap, iso=iso,
+                           make=params["make"], model=params["model"],
+                           shot_date=params["date"])
+
+            rec = None
+            if self.bm is not None:
+                try:
+                    rec = self.bm.begin(src, dst, "overwrite" if overwrite else "copy")
+                except OSError as e:
+                    self.root.after(0, lambda m=str(e):
+                                    self._log(f"无法记备份 {base}: {m}", "err"))
+
+            try:
+                if rec is not None and self.bm is not None:
+                    self.bm.safe_write(rec, save_to)
+                    self.bm.commit(rec)
+                else:
+                    save_to(dst)
                 success += 1
                 self.root.after(0, lambda b=base, d=os.path.basename(dst):
                                 self._log(f"{b}  →  {d}", "ok"))
@@ -1096,15 +1472,25 @@ class ExifCraft:
 
             self.root.after(0, lambda i=idx, t=total:
                             (self.progress.configure(value=i),
-                             self.progress_text.configure(text=f"{i} / {t}")))
+                             self.progress_text.configure(text=f"{i} / {t}  {self._backup_text()}")))
 
         self.root.after(0, lambda s=success, t=total:
                         self._finish_write(s, t))
 
+    def _backup_text(self) -> str:
+        """Status suffix showing what we currently hold for rollback."""
+        if self.bm is None:
+            return ""
+        n = self.bm.backup_count()
+        if not n:
+            return ""
+        mb = self.bm.backup_bytes() / 1024 / 1024
+        return f"· 备份 {n} 个 / {mb:.1f} MB"
+
     def _finish_write(self, success, total):
         self.progress["value"] = 0
-        self.progress_text.configure(text="")
-        self._set_status(f"Done  ·  {success}/{total} succeeded")
+        self.progress_text.configure(text=self._backup_text().lstrip("· "))
+        self._set_status(f"Done  ·  {success}/{total} succeeded  {self._backup_text()}")
         self._log(f"Finished. {success}/{total} succeeded.", "ok"
                   if success == total else "warn")
         messagebox.showinfo(self.APP_NAME,
