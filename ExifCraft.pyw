@@ -71,8 +71,10 @@ class Theme:
     PRIMARY_S   = "#DBEAFE"   # soft / selected
 
     TEXT        = "#0F172A"   # primary text
-    TEXT_2      = "#475569"   # secondary
-    TEXT_3      = "#94A3B8"   # tertiary / placeholder
+    TEXT_2      = "#475569"   # secondary          (7.58:1 on white)
+    # tertiary: darkened from #94A3B8 (2.56:1) to clear WCAG AA 4.5:1 for
+    # hints, placeholders and dimmed rows — 4.76:1 on white, 4.55:1 on SURFACE_2
+    TEXT_3      = "#64748B"
 
     SUCCESS     = "#059669"
     ERROR       = "#DC2626"
@@ -1071,7 +1073,9 @@ class ExifCraft:
 
         # ---- body: two-column (cards) layout
         body = ttk.Frame(outer, style="App.TFrame")
-        body.pack(fill="both", expand=True, pady=(10, 0))
+        # NB: body is NOT packed here (see the bottom-up packing block at the
+        # end of _build) — it must claim space last so the action bar stays on
+        # screen when the window is shorter than the content wants to be.
         body.columnconfigure(0, weight=1, uniform="col")
         body.columnconfigure(1, weight=1, uniform="col")
         body.rowconfigure(0, weight=1)
@@ -1282,8 +1286,10 @@ class ExifCraft:
                        command=self._open_map).pack(side="right")
 
         # ---- bottom action bar + progress + log
+        # Packed side="bottom" below: the four bottom rows claim their space
+        # first so a short window shrinks the file list instead of pushing
+        # these off-screen.
         actions = ttk.Frame(outer, style="App.TFrame")
-        actions.pack(fill="x", pady=(12, 5))
 
         ttk.Button(actions, text="Read EXIF",  style="Ghost.TButton",
                    command=self._read_selected).pack(side="left", padx=(0, 6))
@@ -1300,7 +1306,6 @@ class ExifCraft:
 
         # progress
         prog_row = ttk.Frame(outer, style="App.TFrame")
-        prog_row.pack(fill="x")
         self.progress = ttk.Progressbar(prog_row, orient="horizontal", mode="determinate",
                                         style="Accent.Horizontal.TProgressbar")
         self.progress.pack(side="left", fill="x", expand=True)
@@ -1309,7 +1314,6 @@ class ExifCraft:
 
         # log
         log_holder = ttk.Frame(outer, style="App.TFrame")
-        log_holder.pack(fill="x", pady=(6, 0))
 
         log_frame = ttk.Frame(log_holder, style="Log.TFrame", padding=(8, 6))
         log_frame.pack(fill="x")
@@ -1334,15 +1338,25 @@ class ExifCraft:
 
         # status bar
         status_bar = ttk.Frame(outer, style="App.TFrame")
-        status_bar.pack(fill="x", pady=(6, 0))
         self.status_lbl = ttk.Label(status_bar, textvariable=self.status_var,
                                     style="Status.TLabel")
         self.status_lbl.pack(side="left")
         self.err_lbl = ttk.Label(status_bar, text="", style="Err.TLabel")
         self.err_lbl.pack(side="right")
 
+        # ---- bottom-up packing: each row takes its space before body,
+        # so on a short window the elastic list shrinks, not the action bar.
+        status_bar.pack(side="bottom", fill="x", pady=(6, 0))
+        log_holder.pack(side="bottom", fill="x", pady=(6, 0))
+        prog_row.pack(side="bottom", fill="x")
+        actions.pack(side="bottom", fill="x", pady=(12, 5))
+        body.pack(fill="both", expand=True, pady=(10, 0))
+
         # initial render: chips are created as "☐" but all fields start checked
         self._refresh_fields_ui()
+        # initial render of the file list: with no files picked yet this
+        # plants the empty-state hint row (otherwise the list is a blank void)
+        self._refresh_list()
 
     def _labeled_entry(self, parent, label, var, *, hint=None, col=None, field=None):
         """Build a label + entry (+ optional hint) block. Returns its frame.
@@ -1691,12 +1705,22 @@ class ExifCraft:
         on = self.file_checked[idx]
         self.file_list.delete(idx)
         self.file_list.insert(idx, f"{self.TICK_ON if on else self.TICK_OFF}  {name}")
+        # unticked rows still carry readable text: TEXT_2 is 7.24:1 on the
+        # list background, TEXT_3 would only reach 4.55:1
         self.file_list.itemconfigure(
-            idx, fg=Theme.TEXT if on else Theme.TEXT_3)
+            idx, fg=Theme.TEXT if on else Theme.TEXT_2)
 
     def _refresh_list(self):
         self.file_list.delete(0, "end")
         self.file_checked = [True] * len(self.input_files)   # ticked by default
+        if not self.input_files:
+            # Empty state: on first launch the list is a white void, which
+            # reads as a broken panel. One muted hint row anchors it.
+            # TEXT_3 = 4.76:1 on the list background (WCAG AA normal text).
+            self.file_list.insert("end", "点击 File / Folder 选择图片")
+            self.file_list.itemconfigure(0, fg=Theme.TEXT_3)
+            self._refresh_list_footer()
+            return
         for i, f in enumerate(self.input_files):
             self.file_list.insert("end", f"{self.TICK_ON}  {os.path.basename(f)}")
             self.file_list.itemconfigure(i, fg=Theme.TEXT)
@@ -1710,7 +1734,9 @@ class ExifCraft:
     def _refresh_list_footer(self) -> None:
         n = len(self.input_files)
         picked = sum(1 for c in self.file_checked if c)
-        if picked == n:
+        if n == 0:
+            text = "尚未选择文件"
+        elif picked == n:
             text = f"{n} file{'s' if n != 1 else ''}  ·  全部已勾选"
         else:
             text = f"{n} file{'s' if n != 1 else ''}  ·  已勾选 {picked}"
@@ -1756,7 +1782,9 @@ class ExifCraft:
     # ------------------------------------------------------------------
     def _read_selected(self):
         sel = self.file_list.curselection()
-        if not sel:
+        # bounds guard also covers the empty-state hint row, which is
+        # selectable but has no file behind it
+        if not sel or not (0 <= sel[0] < len(self.input_files)):
             messagebox.showinfo(self.APP_NAME, "Select a file from the list first.")
             return
         path = self.input_files[sel[0]]
