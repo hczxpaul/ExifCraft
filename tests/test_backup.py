@@ -414,10 +414,12 @@ class TestFileTickBoxes:
     def test_row_renders_tick_square(self, app, jpeg_factory):
         app.input_files = [str(jpeg_factory("r1.jpg"))]
         app._refresh_list()
-        assert app.file_list.get(0).startswith("■")
+        assert app._tick_marker(0) == "■"
         app.file_checked[0] = False
         app._render_file_row(0)
-        assert app.file_list.get(0).startswith("□")
+        assert app._tick_marker(0) == "□"
+        # the row itself is repainted too (colour tag flips to "off")
+        assert "off" in app.file_list.item("0", "tags")
 
     def test_toggle_flips_and_refreshes_footer(self, app, jpeg_factory):
         app.input_files = [str(jpeg_factory(f"f{i}.jpg")) for i in range(2)]

@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from fractions import Fraction
 from datetime import datetime
-from PIL import Image, ImageOps, ImageTk, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageDraw, ImageTk, UnidentifiedImageError
 
 import piexif
 
@@ -820,6 +820,15 @@ class ExifCraft:
         self.file_checked: list[bool] = []
         self.worker: threading.Thread | None = None
 
+        # file table state — all in memory, the list never touches the disk
+        self._icon_on: ImageTk.PhotoImage | None = None
+        self._icon_off: ImageTk.PhotoImage | None = None
+        self._status_cache: dict[str, str] = {}     # path -> pending/done/failed
+        self._drag: dict | None = None              # drag-to-sweep session
+        self._sort_col: str | None = None           # None = import order
+        self._sort_rev: bool = False
+        self._import_order: list[str] = []          # order as loaded, for "no sort"
+
         # preview state: LRU cache (path -> PhotoImage) + the currently shown
         # image (kept alive on the instance so Tk never GCs it) + debounce id
         self._preview_cache: OrderedDict[str, ImageTk.PhotoImage] = OrderedDict()
@@ -1027,6 +1036,26 @@ class ExifCraft:
               lightcolor=[("focus", base.PRIMARY), ("!focus", base.BORDER)],
               darkcolor=[("focus", base.PRIMARY), ("!focus", base.BORDER)])
 
+        # File table (ttk.Treeview): one row per image, five columns.
+        # rowheight is set in pixels so the DPI-aware build keeps the same
+        # visual rhythm; the checkbox lives in the tree column as an image.
+        s.configure("Files.Treeview",
+                    background=base.SURFACE, fieldbackground=base.SURFACE,
+                    foreground=base.TEXT, rowheight=28, borderwidth=0,
+                    font=base.FONT_MONO)
+        s.map("Files.Treeview",
+              background=[("selected", base.PRIMARY_S)],
+              foreground=[("selected", base.PRIMARY_H)])
+        s.configure("Files.Treeview.Heading",
+                    background=base.SURFACE_2, foreground=base.TEXT_3,
+                    font=(base.FONT[0], max(9, base.FONT[1] - 2)),
+                    relief="flat", borderwidth=0, padding=(5, 4))
+        s.map("Files.Treeview.Heading",
+              background=[("active", base.BORDER)])
+        # drop the default tree indent/expand indicator — flat table look
+        s.layout("Files.Treeview",
+                 [("Files.Treeview.treearea", {"sticky": "nswe"})])
+
         # Listbox (use Tk widget, but style scrollbar)
         s.configure("Vertical.TScrollbar",
                     background=base.BG, troughcolor=base.BG,
@@ -1115,27 +1144,55 @@ class ExifCraft:
         ttk.Button(row, text="Browse", style="Ghost.TButton",
                    command=self._pick_output).pack(side="left", padx=2)
 
-        # file list
+        # file list — a 5-column table: ☑ / # / 文件名 / 格式 / 状态.
+        # Every cell comes from memory (paths, tick flags, session journal);
+        # the table never stats or opens a file, so switching a 1000-file
+        # folder on a network drive stays instant.
         list_holder = ttk.Frame(src_card.body, style="CardInner.TFrame")
         list_holder.pack(fill="both", expand=True, pady=(8, 4))
 
-        self.file_list = tk.Listbox(
-            list_holder, height=6, activestyle="none",
-            background=Theme.SURFACE_2, foreground=Theme.TEXT,
-            selectbackground=Theme.PRIMARY_S, selectforeground=Theme.PRIMARY_H,
-            relief="flat", highlightthickness=1,
-            highlightbackground=Theme.BORDER, highlightcolor=Theme.PRIMARY,
-            font=Theme.FONT_MONO, bd=0,
+        self._icon_on  = self._check_icon(True)
+        self._icon_off = self._check_icon(False)
+
+        self.file_list = ttk.Treeview(
+            list_holder, columns=("idx", "fmt", "status"),
+            show="tree headings", selectmode="browse", height=8,
+            style="Files.Treeview",
         )
+        self.file_list.heading("#0", text="文件", anchor="w",
+                               command=lambda: self._sort_by("name"))
+        self.file_list.heading("idx", text="#", anchor="e",
+                               command=lambda: self._sort_by(None))
+        self.file_list.heading("fmt", text="格式", anchor="w",
+                               command=lambda: self._sort_by("fmt"))
+        self.file_list.heading("status", text="状态", anchor="w")
+        self.file_list.column("#0",     width=200, stretch=True,  anchor="w")
+        self.file_list.column("idx",    width=42,  stretch=False, anchor="e")
+        self.file_list.column("fmt",    width=58,  stretch=False, anchor="w")
+        self.file_list.column("status", width=64,  stretch=False, anchor="w")
+
+        # row tags: ticked / unticked / failed — plus a zebra stripe that
+        # only sets the background so the two can coexist on one row
+        self.file_list.tag_configure("on",     foreground=Theme.TEXT)
+        self.file_list.tag_configure("off",    foreground=Theme.TEXT_2)
+        self.file_list.tag_configure("failed", foreground=Theme.ERROR)
+        self.file_list.tag_configure("odd",    background="#FAFBFC")
+        self.file_list.tag_configure("even",   background=Theme.SURFACE)
+        self.file_list.tag_configure("hint",   foreground=Theme.TEXT_3)
+
         self.file_list.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(list_holder, orient="vertical",
                            style="Vertical.TScrollbar", command=self.file_list.yview)
         sb.pack(side="right", fill="y")
         self.file_list.configure(yscrollcommand=sb.set)
-        # click a row → flip its tick box; arrows/space stay keyboard-usable
-        self.file_list.bind("<ButtonRelease-1>", self._on_list_click)
-        self.file_list.bind("<space>", self._on_list_space)
-        self.file_list.bind("<<ListboxSelect>>", self._schedule_preview)
+
+        # one press/motion/release trio drives click-to-toggle AND
+        # drag-to-sweep; <space> stays as the keyboard path
+        self.file_list.bind("<ButtonPress-1>",   self._on_list_press)
+        self.file_list.bind("<B1-Motion>",       self._on_list_drag)
+        self.file_list.bind("<ButtonRelease-1>", self._on_list_release)
+        self.file_list.bind("<space>",           self._on_list_space)
+        self.file_list.bind("<<TreeviewSelect>>", self._schedule_preview)
 
         # list footer: tick-all / untick-all / clear
         list_footer = ttk.Frame(src_card.body, style="CardInner.TFrame")
@@ -1716,11 +1773,22 @@ class ExifCraft:
 
     def _preview_for_selection(self):
         self._preview_after_id = None
-        sel = self.file_list.curselection()
-        if not sel or not (0 <= sel[0] < len(self.input_files)):
+        idx = self._selected_index()
+        if idx is None:
             self._preview_state("empty", "选择文件以预览", "")
             return
-        self._show_preview(self.input_files[sel[0]])
+        self._show_preview(self.input_files[idx])
+
+    def _selected_index(self) -> int | None:
+        """Row index behind the current selection, or None.
+
+        Guards against the empty-state hint row, whose iid is not numeric.
+        """
+        sel = self.file_list.selection()
+        if not sel or not sel[0].isdigit():
+            return None
+        idx = int(sel[0])
+        return idx if 0 <= idx < len(self.input_files) else None
 
     # ------------------------------------------------------------------
     #  Logging & status
@@ -1779,41 +1847,130 @@ class ExifCraft:
         self._log("File list cleared.", "muted")
 
     # ------------------------------------------------------------------
-    #  File tick boxes
+    #  File table  ── 5 columns, rendered entirely from memory
     # ------------------------------------------------------------------
-    TICK_ON, TICK_OFF = "■", "□"                 # solid square = will be written
+    TICK_ON, TICK_OFF = "■", "□"      # text marker (logs / tests)
+    HINT_IID = "__hint__"             # empty-state row (never a real file)
+
+    @staticmethod
+    def _check_icon(on: bool) -> ImageTk.PhotoImage:
+        """18x18 rounded checkbox for the tree column.
+
+        Drawn with Pillow instead of a unicode glyph so the box keeps an
+        exact size and colour regardless of the user's font. Two shared
+        images serve every row.
+        """
+        im = Image.new("RGBA", (23, 18), (0, 0, 0, 0))   # 5px gap on the right
+        d = ImageDraw.Draw(im)
+        if on:
+            d.rounded_rectangle((1, 1, 16, 16), radius=3, fill=Theme.PRIMARY)
+            d.line((5, 9, 8, 12), fill="#FFFFFF", width=2)
+            d.line((8, 12, 12, 5), fill="#FFFFFF", width=2)
+        else:
+            d.rounded_rectangle((1, 1, 16, 16), radius=3,
+                                fill=Theme.SURFACE, outline="#94A3B8", width=2)
+        return ImageTk.PhotoImage(im)
+
+    def _tick_marker(self, idx: int) -> str:
+        """■/□ for logs and tests — independent of what is rendered."""
+        return self.TICK_ON if self.file_checked[idx] else self.TICK_OFF
+
+    # ---- write status (from the session journal, zero file IO) ----------
+    def _refresh_status_index(self) -> None:
+        self._status_cache = (
+            {r.src: r.state for r in self.bm.recs} if self.bm else {})
+
+    def _status_of(self, path: str) -> str | None:
+        return self._status_cache.get(path)
+
+    def _status_text(self, idx: int) -> str:
+        return {"pending": "写入中", "done": "已写入",
+                "failed": "失败"}.get(self._status_of(self.input_files[idx]), "就绪")
+
+    def _row_tag(self, idx: int) -> str:
+        """Colour tag for one row: failure wins over the tick state."""
+        if self._status_of(self.input_files[idx]) == "failed":
+            return "failed"
+        return "on" if self.file_checked[idx] else "off"
+
+    def _zebra(self, idx: int) -> str:
+        return "odd" if idx % 2 else "even"
+
+    def _refresh_status_column(self) -> None:
+        """Re-read the journal and repaint the status cells.
+
+        Called after a write batch and after a rollback — never on a timer.
+        """
+        self._refresh_status_index()
+        for i in range(len(self.input_files)):
+            iid = str(i)
+            if self.file_list.exists(iid):
+                self.file_list.set(iid, "status", self._status_text(i))
+                self.file_list.item(iid, tags=(self._zebra(i), self._row_tag(i)))
+
+    # ---- row painting ---------------------------------------------------
+    def _set_row_state(self, idx: int) -> None:
+        """Repaint one row's checkbox + colour. No file access."""
+        iid = str(idx)
+        if not self.file_list.exists(iid):
+            return
+        self.file_list.item(
+            iid,
+            image=self._icon_on if self.file_checked[idx] else self._icon_off,
+            tags=(self._zebra(idx), self._row_tag(idx)))
 
     def _render_file_row(self, idx: int) -> None:
-        """Redraw one row: tick square + filename, dimmed when unticked."""
-        name = os.path.basename(self.input_files[idx])
-        on = self.file_checked[idx]
-        self.file_list.delete(idx)
-        self.file_list.insert(idx, f"{self.TICK_ON if on else self.TICK_OFF}  {name}")
-        # unticked rows still carry readable text: TEXT_2 is 7.24:1 on the
-        # list background, TEXT_3 would only reach 4.55:1
-        self.file_list.itemconfigure(
-            idx, fg=Theme.TEXT if on else Theme.TEXT_2)
+        """Backwards-compatible alias kept for callers and tests."""
+        self._set_row_state(idx)
+
+    # ---- list construction ----------------------------------------------
+    @staticmethod
+    def _ext_of(path: str) -> str:
+        return os.path.splitext(path)[1].lstrip(".").upper() or "—"
 
     def _refresh_list(self):
-        self.file_list.delete(0, "end")
-        self.file_checked = [True] * len(self.input_files)   # ticked by default
+        """Rebuild after a new folder/file selection: everything ticked."""
+        self.file_checked = [True] * len(self.input_files)
+        self._import_order = list(self.input_files)   # the "no sort" order
+        self._sort_col, self._sort_rev = None, False
+        self._refresh_list_headers()
+        self._rebuild_rows()
+
+    def _rebuild_rows(self, keep_selection: str | None = None) -> None:
+        """Insert one row per file. Pure memory — no stat, no open."""
+        tv = self.file_list
+        kids = tv.get_children()
+        if kids:
+            tv.delete(*kids)
+
         if not self.input_files:
-            # Empty state: on first launch the list is a white void, which
-            # reads as a broken panel. One muted hint row anchors it.
-            # TEXT_3 = 4.76:1 on the list background (WCAG AA normal text).
-            self.file_list.insert("end", "点击 File / Folder 选择图片")
-            self.file_list.itemconfigure(0, fg=Theme.TEXT_3)
+            # Empty state: a blank table reads as a broken panel.
+            # TEXT_3 (#64748B) = 4.76:1 on white — WCAG AA body text.
+            tv.insert("", "end", iid=self.HINT_IID,
+                      text="点击 File / Folder 选择图片",
+                      values=("", "", ""), tags=("hint",))
             self._refresh_list_footer()
             return
+
+        self._refresh_status_index()
         for i, f in enumerate(self.input_files):
-            self.file_list.insert("end", f"{self.TICK_ON}  {os.path.basename(f)}")
-            self.file_list.itemconfigure(i, fg=Theme.TEXT)
+            tv.insert("", "end", iid=str(i),
+                      text=os.path.basename(f),
+                      image=self._icon_on if self.file_checked[i] else self._icon_off,
+                      values=(str(i + 1), self._ext_of(f), self._status_text(i)),
+                      tags=(self._zebra(i), self._row_tag(i)))
+
         self._refresh_list_footer()
-        if self.input_files:            # auto-select first → fires preview
-            self.file_list.selection_set(0)
-            # NB: Tk does not guarantee <<ListboxSelect>> for a programmatic
-            # selection_set, so schedule the preview explicitly here.
-            self._schedule_preview()
+        target = keep_selection or "0"
+        if not tv.exists(target):
+            target = "0" if tv.exists("0") else ""
+        if target:
+            tv.selection_set(target)
+            tv.focus(target)
+            tv.see(target)
+        # Tk does not guarantee <<TreeviewSelect>> for a programmatic
+        # selection — schedule the preview explicitly.
+        self._schedule_preview()
 
     def _refresh_list_footer(self) -> None:
         n = len(self.input_files)
@@ -1826,34 +1983,158 @@ class ExifCraft:
             text = f"{n} file{'s' if n != 1 else ''}  ·  已勾选 {picked}"
         self.list_count_lbl.configure(text=text)
 
-    def _on_list_click(self, event):
-        """Mouse: tick the row under the cursor."""
-        self._toggle_file_tick(self.file_list.nearest(event.y))
+    # ---- column sorting (in-memory paths only) --------------------------
+    def _sort_by(self, col: str | None) -> None:
+        """Sort by name/fmt; clicking the same header flips the direction,
+        clicking '#' restores the import order."""
+        if not self.input_files:
+            return
+        keep = self._selected_path()
+
+        if col is None:
+            self._sort_col, self._sort_rev = None, False
+        elif self._sort_col == col:
+            self._sort_rev = not self._sort_rev
+        else:
+            self._sort_col, self._sort_rev = col, False
+
+        pairs = list(zip(self.input_files, self.file_checked))
+        if self._sort_col == "name":
+            pairs.sort(key=lambda t: os.path.basename(t[0]).lower(),
+                       reverse=self._sort_rev)
+        elif self._sort_col == "fmt":
+            pairs.sort(key=lambda t: (os.path.splitext(t[0])[1].lower(),
+                                      os.path.basename(t[0]).lower()),
+                       reverse=self._sort_rev)
+        else:
+            # true import order, not a re-sort of the paths
+            rank = {p: i for i, p in enumerate(getattr(self, "_import_order", []))}
+            pairs.sort(key=lambda t: rank.get(t[0], len(rank)))
+
+        # tick flags travel with their file, not with the row number
+        self.input_files = [p for p, _c in pairs]
+        self.file_checked = [c for _p, c in pairs]
+
+        self._refresh_list_headers()
+        self._rebuild_rows(keep_selection=self._iid_of_path(keep))
+
+    def _selected_path(self) -> str | None:
+        sel = self.file_list.selection()
+        if sel and sel[0].isdigit() and int(sel[0]) < len(self.input_files):
+            return self.input_files[int(sel[0])]
+        return None
+
+    def _iid_of_path(self, path: str | None) -> str | None:
+        if path is not None and path in self.input_files:
+            return str(self.input_files.index(path))
+        return None
+
+    def _refresh_list_headers(self) -> None:
+        """Show ▲/▼ on the active sort column.
+
+        Import order (no explicit sort) shows no arrow — there is nothing
+        to indicate, and the marks would crowd the narrow columns.
+        """
+        active = {"name": "#0", "fmt": "fmt"}.get(self._sort_col or "")
+        for col, text in (("#0", "文件"), ("idx", "#"), ("fmt", "格式")):
+            mark = ""
+            if active and col == active:
+                mark = " ▼" if self._sort_rev else " ▲"
+            self.file_list.heading(col, text=text + mark)
+
+    # ---- click / drag-to-sweep ------------------------------------------
+    def _on_list_press(self, event):
+        """Remember the drag origin. Deliberately does NOT return 'break':
+        Treeview moves the selection, so the preview follows the cursor."""
+        iid = self.file_list.identify_row(event.y)
+        if not iid or iid == self.HINT_IID:
+            self._drag = None
+            return
+        self._drag = {
+            "from": iid,
+            "value": not self.file_checked[int(iid)],   # fixed target, not a toggle
+            # empty on purpose: the first motion repaints the origin row too
+            # (a sweep is inclusive of where it started, a plain click is not)
+            "seen": set(),
+            "moved": False,
+        }
+
+    def _on_list_drag(self, event):
+        """Sweep: paint every row crossed with the fixed target value."""
+        d = self._drag
+        if not d:
+            return "break"
+        iid = self.file_list.identify_row(event.y)
+        if iid and iid != self.HINT_IID:
+            if iid != d["from"]:
+                d["moved"] = True
+            for r in self._rows_between(d["from"], iid):
+                if r in d["seen"]:
+                    continue          # never re-flip: sweeping back and forth
+                d["seen"].add(r)      # must leave a uniform block
+                self._apply_tick(int(r), d["value"])
+        self._autoscroll(event)
+        return "break"
+
+    def _on_list_release(self, event):
+        d, self._drag = self._drag, None
+        if d and not d["moved"]:
+            self._toggle_file_tick(int(d["from"]))      # plain click
+        elif d:
+            self._refresh_list_footer()                 # one refresh per sweep
+        return "break"
+
+    def _rows_between(self, a: str, b: str) -> list[str]:
+        """Display-order iids from *a* to *b*, both ends included."""
+        rows = [i for i in self.file_list.get_children() if i != self.HINT_IID]
+        try:
+            i, j = rows.index(a), rows.index(b)
+        except ValueError:
+            return []
+        return rows[min(i, j):max(i, j) + 1]
+
+    def _apply_tick(self, idx: int, value: bool) -> None:
+        if 0 <= idx < len(self.input_files) and self.file_checked[idx] != value:
+            self.file_checked[idx] = value
+            self._set_row_state(idx)
+
+    def _autoscroll(self, event) -> None:
+        """Keep sweeping when the pointer is held against an edge."""
+        h = self.file_list.winfo_height()
+        if event.y < 10:
+            self.file_list.yview_scroll(-1, "units")
+        elif event.y > h - 10:
+            self.file_list.yview_scroll(1, "units")
 
     def _on_list_space(self, _event=None):
-        """Keyboard: tick the currently highlighted row.
+        """Keyboard: tick the highlighted row.
 
-        Distinct from the mouse path on purpose — a key event also carries
-        mouse coordinates, and using those here would tick the wrong row.
+        Reads the selection instead of the event coordinates — a key event
+        still carries mouse coordinates, which would tick the wrong row.
         """
-        sel = self.file_list.curselection()
-        self._toggle_file_tick(sel[0] if sel else None)
+        sel = self.file_list.selection()
+        if not sel or not sel[0].isdigit():
+            return
+        self._toggle_file_tick(int(sel[0]))
 
     def _toggle_file_tick(self, idx: int | None) -> None:
         """Flip the tick box of row *idx* and keep row/preview in sync."""
         if idx is None or not (0 <= idx < len(self.input_files)):
             return
         self.file_checked[idx] = not self.file_checked[idx]
-        self._render_file_row(idx)
+        self._set_row_state(idx)
         self._refresh_list_footer()
-        self.file_list.selection_clear(0, "end")
-        self.file_list.selection_set(idx)
+        iid = str(idx)
+        self.file_list.selection_set(iid)
+        self.file_list.focus(iid)
         self._schedule_preview()             # keep the preview in sync
 
     def _tick_all_files(self, value: bool):
+        if not self.input_files:
+            return
         self.file_checked = [value] * len(self.input_files)
         for i in range(len(self.input_files)):
-            self._render_file_row(i)
+            self._set_row_state(i)
         self._refresh_list_footer()
         self._log(f"{'勾选' if value else '取消勾选'}全部文件。", "muted")
 
@@ -1865,13 +2146,12 @@ class ExifCraft:
     #  Read existing EXIF
     # ------------------------------------------------------------------
     def _read_selected(self):
-        sel = self.file_list.curselection()
-        # bounds guard also covers the empty-state hint row, which is
-        # selectable but has no file behind it
-        if not sel or not (0 <= sel[0] < len(self.input_files)):
+        # _selected_index() already rejects the empty-state hint row
+        idx = self._selected_index()
+        if idx is None:
             messagebox.showinfo(self.APP_NAME, "Select a file from the list first.")
             return
-        path = self.input_files[sel[0]]
+        path = self.input_files[idx]
         try:
             info = read_exif_info(path)
         except Exception as e:
@@ -2110,6 +2390,7 @@ class ExifCraft:
         self._set_status(f"已回滚 {done} 项")
         self.progress_text.configure(text="")
         self._update_rollback_btn()
+        self._refresh_status_column()      # rows fall back to "就绪"
         if skipped:
             messagebox.showwarning(
                 self.APP_NAME,
@@ -2137,6 +2418,7 @@ class ExifCraft:
         self.progress_text.configure(text=self._backup_text().lstrip("· "))
         self._set_status(f"Done  ·  {success}/{total} succeeded  {self._backup_text()}")
         self._update_rollback_btn()
+        self._refresh_status_column()      # 就绪 → 已写入 / 失败
         self._log(f"Finished. {success}/{total} succeeded.", "ok"
                   if success == total else "warn")
         messagebox.showinfo(self.APP_NAME,
