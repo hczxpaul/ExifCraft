@@ -477,3 +477,61 @@ class TestRollbackBothModes:
 
         assert "删除" in seen["text"] and "副本" in seen["text"]
         assert "还原" not in seen["text"]
+
+
+class TestLiveStatusUpdates:
+    """Rows must report their own state, not wait for the whole batch."""
+
+    def test_rows_end_up_written(self, app, no_dialogs, jpeg_factory, tmp_path):
+        files = [str(jpeg_factory(f"live{i}.jpg")) for i in range(3)]
+        app.input_files = files
+        app._refresh_list()
+        app._write_worker(files, str(tmp_path / "o"), PARAMS, overwrite=False)
+        app.root.update()
+        for i, path in enumerate(files):
+            assert app._status_of(path) == "done"
+            assert app._status_text(i) == "已写入"
+
+    def test_failed_file_is_marked(self, app, no_dialogs, jpeg_factory, tmp_path):
+        good = str(jpeg_factory("okfile.jpg"))
+        bad = tmp_path / "broken.jpg"
+        bad.write_bytes(b"not an image at all")
+        app.input_files = [good, str(bad)]
+        app._refresh_list()
+        app._write_worker([good, str(bad)], str(tmp_path / "o"), PARAMS,
+                          overwrite=False)
+        app.root.update()
+        assert app._status_of(good) == "done"
+        assert app._status_of(str(bad)) == "failed"
+        assert app._status_text(1) == "失败"
+
+    def test_mark_status_touches_one_row(self, app, jpeg_factory):
+        files = [str(jpeg_factory(f"one{i}.jpg")) for i in range(3)]
+        app.input_files = files
+        app._refresh_list()
+        app.root.update()
+
+        app._mark_status(1, "done")
+
+        assert app._status_of(files[1]) == "done"
+        assert app._status_of(files[0]) is None      # neighbours untouched
+        assert app._status_of(files[2]) is None
+
+    def test_pending_shows_as_writing(self, app, jpeg_factory):
+        path = str(jpeg_factory("pend.jpg"))
+        app.input_files = [path]
+        app._refresh_list()
+        app._mark_status(0, "pending")
+        assert app._status_text(0) == "写入中"
+
+    def test_refresh_reconciles_with_the_journal(self, app, no_dialogs,
+                                                 jpeg_factory, tmp_path):
+        files = [str(jpeg_factory(f"rec{i}.jpg")) for i in range(2)]
+        app.input_files = files
+        app._refresh_list()
+        app._write_worker(files, str(tmp_path / "o"), PARAMS, overwrite=False)
+        app.root.update()
+        app._status_cache.clear()                    # pretend stale UI
+        app._refresh_status_column()
+        for path in files:
+            assert app._status_of(path) == "done"

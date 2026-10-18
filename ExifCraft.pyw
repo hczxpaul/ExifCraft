@@ -2118,16 +2118,39 @@ class ExifCraft:
         return "odd" if idx % 2 else "even"
 
     def _refresh_status_column(self) -> None:
-        """Re-read the journal and repaint the status cells.
+        """Re-read the journal and repaint every status cell.
 
-        Called after a write batch and after a rollback — never on a timer.
+        Called after a batch and after a rollback. During a batch each row is
+        repainted on its own instead (see _mark_status), so the list moves
+        while the work is happening rather than only at the end.
         """
         self._refresh_status_index()
         for i in range(len(self.input_files)):
-            iid = str(i)
-            if self.file_list.exists(iid):
-                self.file_list.set(iid, "status", self._status_text(i))
-                self.file_list.item(iid, tags=(self._zebra(i), self._row_tag(i)))
+            self._paint_row(i)
+
+    def _paint_row(self, idx: int) -> None:
+        """Repaint one row's status text + colours. O(1), no file access."""
+        iid = str(idx)
+        if not self.file_list.exists(iid):
+            return
+        self.file_list.set(iid, "status", self._status_text(idx))
+        self.file_list.item(iid, tags=(self._zebra(idx), self._row_tag(idx)))
+
+    def _mark_status(self, idx: int, state: str | None) -> None:
+        """Set one file's state (pending/done/failed) and repaint that row.
+
+        Updates the cache in place — rebuilding it from the journal on every
+        file would be O(n²) for a batch. The final _refresh_status_column()
+        reconciles everything with the journal's truth.
+        """
+        if not 0 <= idx < len(self.input_files):
+            return
+        path = self.input_files[idx]
+        if state is None:
+            self._status_cache.pop(path, None)
+        else:
+            self._status_cache[path] = state
+        self._paint_row(idx)
 
     # ---- row painting ---------------------------------------------------
     def _set_row_state(self, idx: int) -> None:
@@ -2679,15 +2702,31 @@ class ExifCraft:
 
         self.worker = threading.Thread(
             target=self._write_worker,
-            args=(files, out_dir, fields, overwrite),
+            args=(files, out_dir, fields, overwrite,
+                  {p: i for i, p in enumerate(self.input_files)}),
             daemon=True,
         )
         self.worker.start()
 
-    def _write_worker(self, files, out_dir, fields: dict, overwrite):
-        """Write *fields* (a partial field set) into every file in *files*."""
+    def _write_worker(self, files, out_dir, fields: dict, overwrite,
+                      row_of: dict | None = None):
+        """Write *fields* (a partial field set) into every file in *files*.
+
+        *row_of* maps a path to its row in the list, so each file can be
+        repainted in O(1) as it finishes instead of the whole column waiting
+        for the batch to end.
+        """
         success = 0
         total = len(files)
+        if row_of is None:
+            row_of = {p: i for i, p in enumerate(self.input_files)}
+        rows = [row_of.get(p) for p in files]
+
+        def mark_pending():
+            for r in rows:
+                if r is not None:
+                    self._mark_status(r, "pending")
+        self.root.after(0, mark_pending)
         # defensive: the worker owns the destination, so make sure it exists
         if not overwrite:
             try:
@@ -2700,6 +2739,7 @@ class ExifCraft:
 
         for idx, src in enumerate(files, 1):
             base = os.path.basename(src)
+            row = row_of.get(src)
             name, ext = os.path.splitext(base)
             if overwrite:
                 dst = src
@@ -2716,6 +2756,8 @@ class ExifCraft:
             except OSError as e:
                 self.root.after(0, lambda b=base, m=str(e):
                                 self._log(f"{b} failed: {m}", "err"))
+                if row is not None:
+                    self.root.after(0, lambda r=row: self._mark_status(r, "failed"))
                 continue
 
             # Classify from the bytes, not the extension: a .jpg may be a
@@ -2746,9 +2788,13 @@ class ExifCraft:
                         if kind == "motion-jpeg" else "")
                 self.root.after(0, lambda b=base, d=os.path.basename(dst), n=note:
                                 self._log(f"{b}  →  {d}{n}", "ok"))
+                if row is not None:
+                    self.root.after(0, lambda r=row: self._mark_status(r, "done"))
             except Exception as e:
                 self.root.after(0, lambda b=base, m=str(e):
                                 self._log(f"{b} failed: {m}", "err"))
+                if row is not None:
+                    self.root.after(0, lambda r=row: self._mark_status(r, "failed"))
 
             self.root.after(0, lambda i=idx, t=total:
                             (self.progress.configure(value=i),
