@@ -742,6 +742,7 @@ class ExifCraft:
         self._sort_rev: bool = False
         self._import_order: list[str] = []          # order as loaded, for "no sort"
         self._preview_refit_id: str | None = None   # preview resize debounce
+        self._map_win: tk.Toplevel | None = None    # single map-picker window
         self._preview_box: tk.Frame | None = None
         self._fit_after_id: str | None = None       # column auto-fit debounce
         self._name_font = tkfont.Font(font=Theme.FONT_MONO)   # for measuring names
@@ -2487,11 +2488,26 @@ class ExifCraft:
                                 "Install tkintermapview to enable:\n"
                                 "  pip install tkintermapview")
             return
+        # Refuse while a write is running: the tile threads would compete
+        # with the worker for the UI thread and make both feel frozen.
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(self.APP_NAME, "正在写入，完成后再打开地图。")
+            return
+        # Single window. Each TkinterMapView starts ~13 tile/download threads;
+        # letting the user stack several of them is how the app used to end up
+        # with a hundred busy threads.
+        if self._map_win is not None and self._map_win.winfo_exists():
+            self._map_win.deiconify()
+            self._map_win.lift()
+            self._map_win.focus_force()
+            return
+
         win = tk.Toplevel(self.root)
         win.title(f"{self.APP_NAME}  ·  Map picker")
         win.geometry("640x520")
         win.configure(bg=Theme.BG)
         self._apply_icon(win)
+        self._map_win = win
 
         m = TkinterMapView(win, width=640, height=440, corner_radius=0)
         m.pack(fill="both", expand=True, padx=10, pady=10)
@@ -2517,8 +2533,30 @@ class ExifCraft:
 
         m.add_left_click_map_command(on_click)
 
+        def close():
+            """Destroy the map widget first, then the window.
+
+            TkinterMapView overrides destroy() to set running=False, which is
+            the only thing that stops its worker threads. Destroying the
+            Toplevel alone does NOT call that override, so the threads used to
+            keep spinning — retrying failed tile requests with no sleep — until
+            the CPU was saturated and the whole app stopped responding.
+            """
+            try:
+                # drain the queues first so idle threads see running=False on
+                # their very next iteration instead of after a request timeout
+                m.image_load_queue_tasks.clear()
+                m.image_load_queue_results.clear()
+                m.destroy()
+            except tk.TclError:
+                pass
+            finally:
+                self._map_win = None
+                win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
         ttk.Button(win, text="Close", style="Ghost.TButton",
-                   command=win.destroy).pack(pady=(0, 10))
+                   command=close).pack(pady=(0, 10))
 
     # ------------------------------------------------------------------
     #  Writing (off the UI thread)
