@@ -186,3 +186,52 @@ class TestCachedMapView:
         photo = view.request_image(8, 1, 9)
         assert photo == view.empty_tile_image
         assert cache.get(8, 1, 9) is None      # failures are not cached
+
+
+class TestAutomaticEviction:
+    """Put must keep the cache inside its budget without being told to."""
+
+    def test_put_evicts_automatically(self, tmp_path):
+        data = png_bytes()
+        c = TileCache(tmp_path / "t.db", max_bytes=len(data) * 12)
+        for i in range(60):
+            c.put(8, i, 0, data)
+        count, size = c.stats()
+        assert size <= c.max_bytes, f"{size} > {c.max_bytes}"
+        assert count < 60                       # older tiles were dropped
+        assert c.get(8, 59, 0) is not None      # newest survives
+
+    def test_oldest_goes_first(self, tmp_path):
+        data = png_bytes()
+        c = TileCache(tmp_path / "t.db", max_bytes=len(data) * 12)
+        for i in range(40):
+            c.put(8, i, 0, data)
+            c._conn().execute("UPDATE tiles SET used=? WHERE x=?", (1000 + i, i))
+            c._conn().commit()
+        c.prune()
+        assert c.get(8, 39, 0) is not None      # most recent
+        assert c.get(8, 0, 0) is None           # oldest evicted
+
+    def test_concurrent_puts_with_eviction(self, tmp_path):
+        data = png_bytes()
+        c = TileCache(tmp_path / "t.db", max_bytes=len(data) * 10)
+
+        def worker(n):
+            for i in range(12):
+                c.put(8, n, i, data)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        count, size = c.stats()
+        assert size <= c.max_bytes, f"{size} > {c.max_bytes}"
+        assert count > 0                        # pruning must not empty it
+
+    def test_prune_interval_scales_with_budget(self, tmp_path):
+        small = TileCache(tmp_path / "a.db", max_bytes=100 * 1024)
+        big = TileCache(tmp_path / "b.db", max_bytes=100 * 1024 * 1024)
+        assert small._prune_every < big._prune_every
+        assert small._prune_every >= 4096       # never scan per tile

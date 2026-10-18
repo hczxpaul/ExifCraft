@@ -27,6 +27,8 @@ class TileCache:
         self.path = Path(path)
         self.max_bytes = max_bytes
         self._local = threading.local()
+        self._prune_lock = threading.Lock()
+        self._since_prune = 0
         self._init_db()
 
     # -- connection handling ------------------------------------------------
@@ -60,20 +62,24 @@ class TileCache:
     def get(self, z: int, x: int, y: int) -> bytes | None:
         try:
             row = self._conn().execute(
-                "SELECT data FROM tiles WHERE z=? AND x=? AND y=?",
+                "SELECT data, used FROM tiles WHERE z=? AND x=? AND y=?",
                 (z, x, y)).fetchone()
         except sqlite3.Error:
             return None
         if row is None:
             return None
-        # touch for LRU; cheap single-row update
-        try:
-            self._conn().execute(
-                "UPDATE tiles SET used=? WHERE z=? AND x=? AND y=?",
-                (int(time.time()), z, x, y))
-            self._conn().commit()
-        except sqlite3.Error:
-            pass
+        # Touch for LRU, but not on every hit: an UPDATE + commit per tile
+        # turned a 12-tile screen into 12 fsyncs. An hour of granularity is
+        # plenty for eviction order.
+        now = int(time.time())
+        if now - int(row[1]) > 3600:
+            try:
+                self._conn().execute(
+                    "UPDATE tiles SET used=? WHERE z=? AND x=? AND y=?",
+                    (now, z, x, y))
+                self._conn().commit()
+            except sqlite3.Error:
+                pass
         return bytes(row[0])
 
     def put(self, z: int, x: int, y: int, data: bytes) -> None:
@@ -86,7 +92,19 @@ class TileCache:
                 (z, x, y, data, int(time.time())))
             self._conn().commit()
         except sqlite3.Error:
-            pass
+            return
+        # Evict on the way in: without this the cache grew until the disk was
+        # full and then every insert failed silently. Checking on every write
+        # would mean a table scan per tile, so batch it — at most 5% over
+        # budget, checked every few hundred tiles at the default size.
+        self._since_prune += len(data)
+        if self._since_prune >= self._prune_every:
+            self._since_prune = 0
+            self.prune()
+
+    @property
+    def _prune_every(self) -> int:
+        return max(4096, int(self.max_bytes * 0.05))
 
     def drop(self, z: int, x: int, y: int) -> None:
         try:
@@ -110,29 +128,31 @@ class TileCache:
     def prune(self) -> int:
         """Drop least-recently-used tiles until under ~80% of the budget.
 
-        Returns the number of tiles removed.
+        Returns the number of tiles removed. Serialised with a lock: several
+        download threads can cross the threshold at the same time.
         """
-        count, total = self.stats()
-        if total <= self.max_bytes:
-            return 0
-        target = int(self.max_bytes * 0.8)
-        removed, freed = 0, 0
-        conn = self._conn()
-        try:
-            rows = conn.execute(
-                "SELECT z, x, y, LENGTH(data) FROM tiles ORDER BY used ASC"
-            ).fetchall()
-            for z, x, y, size in rows:
-                if total - freed <= target:
-                    break
-                conn.execute("DELETE FROM tiles WHERE z=? AND x=? AND y=?",
-                             (z, x, y))
-                freed += size
-                removed += 1
-            conn.commit()
-        except sqlite3.Error:
+        with self._prune_lock:
+            count, total = self.stats()
+            if total <= self.max_bytes:
+                return 0
+            target = int(self.max_bytes * 0.8)
+            removed, freed = 0, 0
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    "SELECT z, x, y, LENGTH(data) FROM tiles ORDER BY used ASC"
+                ).fetchall()
+                for z, x, y, size in rows:
+                    if total - freed <= target:
+                        break
+                    conn.execute("DELETE FROM tiles WHERE z=? AND x=? AND y=?",
+                                 (z, x, y))
+                    freed += size
+                    removed += 1
+                conn.commit()
+            except sqlite3.Error:
+                return removed
             return removed
-        return removed
 
     def clear(self) -> None:
         try:
