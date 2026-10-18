@@ -1,4 +1,5 @@
 """Tests for feature 2: partial (single-field) EXIF editing."""
+import os
 from pathlib import Path
 
 import piexif
@@ -348,3 +349,61 @@ class TestImportTemplate:
                             lambda **kw: str(bad))
         app._import_template()          # showerror is swallowed by no_dialogs
         assert app.field_vars["make"].get() == ""
+
+
+class TestReadDoesNotBlankTheForm:
+    """A file with no EXIF must not wipe what the user already typed."""
+
+    def test_read_of_bare_file_keeps_existing_values(self, app, no_dialogs,
+                                                     jpeg_factory):
+        src = str(jpeg_factory("bare.jpg"))          # written without EXIF
+        app.input_files = [src]
+        app._refresh_list()
+        app.make_var.set("NIKON")
+        app.field_vars["iso"].set("400")
+
+        app.file_list.selection_set("0")
+        app._read_selected()
+        app.root.update()
+
+        assert app.make_var.get() == "NIKON"
+        assert app.field_vars["iso"].get() == "400"
+
+    def test_read_of_bare_file_says_so(self, app, mod, monkeypatch,
+                                       no_dialogs, jpeg_factory):
+        src = str(jpeg_factory("bare2.jpg"))
+        app.input_files = [src]
+        app._refresh_list()
+        seen = {}
+        def capture(title, message="", **kw):
+            seen["text"] = message
+            return True
+        monkeypatch.setattr(mod.messagebox, "showinfo", capture)
+
+        app.file_list.selection_set("0")
+        app._read_selected()
+
+        assert "没有 EXIF" in seen["text"]
+        assert os.path.basename(src) in seen["text"]
+
+    def test_read_of_populated_file_still_fills(self, app, no_dialogs,
+                                                jpeg_factory):
+        src = str(jpeg_factory("rich.jpg", gps=True))
+        app.input_files = [src]
+        app._refresh_list()
+        app.make_var.set("")
+
+        app.file_list.selection_set("0")
+        app._read_selected()
+        app.root.update()
+
+        assert app.field_vars["latitude"].get()      # got the GPS back
+
+    def test_template_without_exif_keeps_form(self, app, mod, monkeypatch,
+                                              no_dialogs, jpeg_factory):
+        bare = str(jpeg_factory("tmpl_bare.jpg"))
+        app.make_var.set("Canon")
+        monkeypatch.setattr(mod.filedialog, "askopenfilename",
+                            lambda *a, **k: bare)
+        app._import_template()
+        assert app.make_var.get() == "Canon"

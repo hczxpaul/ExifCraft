@@ -2472,21 +2472,38 @@ class ExifCraft:
         self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
         self._refresh_fields_ui()
 
+    def _report_empty_exif(self, name: str) -> None:
+        """Say the file carries no EXIF instead of blanking the form.
+
+        read_exif_info() returns all-empty strings for a file without EXIF,
+        and filling the form with them is indistinguishable from a dead
+        button — plus it throws away whatever the user had already typed.
+        """
+        messagebox.showinfo(
+            self.APP_NAME,
+            f"{name} 里没有 EXIF 数据。\n\n"
+            f"表单保持原样，不会清空你已填的内容。")
+        self._log(f"{name} 无 EXIF 数据，表单未改动", "warn")
+
     def _read_selected(self):
         # _selected_index() already rejects the empty-state hint row
         idx = self._selected_index()
         if idx is None:
-            messagebox.showinfo(self.APP_NAME, "Select a file from the list first.")
+            messagebox.showinfo(self.APP_NAME, "先从列表里选中一个文件。")
             return
         path = self.input_files[idx]
         try:
             info = read_exif_info(path)
         except Exception as e:
-            messagebox.showerror(self.APP_NAME, f"Failed to read EXIF:\n{e}")
+            messagebox.showerror(self.APP_NAME, f"读取 EXIF 失败：\n{e}")
+            return
+        if not any(info.values()):
+            self._report_empty_exif(os.path.basename(path))
             return
 
         self._fill_form_from_info(info)
-        self._log(f"Loaded EXIF from {os.path.basename(path)}", "ok")
+        self._log(f"已从 {os.path.basename(path)} 载入 "
+                  f"{sum(1 for v in info.values() if v)} 个字段", "ok")
 
     def _import_template(self) -> None:
         """Pick any photo and adopt its EXIF as the standard for this batch.
@@ -2504,6 +2521,9 @@ class ExifCraft:
             info = read_exif_info(p)
         except Exception as e:
             messagebox.showerror(self.APP_NAME, f"无法读取模板照片：\n{e}")
+            return
+        if not any(info.values()):
+            self._report_empty_exif(os.path.basename(p))
             return
 
         self._fill_form_from_info(info)
