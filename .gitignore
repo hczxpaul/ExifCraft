@@ -7,6 +7,12 @@ __pycache__/
 build/
 dist/
 *.spec
+*.manifest
+*.log
+
+# ---- Tooling caches ----
+.mypy_cache/
+.ruff_cache/
 
 # ---- Virtual environments ----
 .venv/
