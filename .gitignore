@@ -37,6 +37,10 @@ htmlcov/
 # ._ExifCraft_bak_<session>_<name>.exifbak
 *.exifbak
 ._ExifCraft_bak_*
+# Map tile cache (SQLite): written next to the script when run from source
+# and the map picker is used (APP_DIR/map_tiles.db, see ExifCraft.pyw).
+# Rebuilt on demand — up to 100 MB of tiles, never source material.
+map_tiles.db
 
 # ---- IDE / editor ----
 .idea/
