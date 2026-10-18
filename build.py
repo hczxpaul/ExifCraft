@@ -25,6 +25,7 @@ os.chdir(APP_DIR)
 APP_NAME  = "ExifCraft"
 ENTRY     = "ExifCraft.pyw"
 ICON      = "ExifCraft.ico"
+MANIFEST  = "ExifCraft.manifest"   # DPI awareness for 4K / 200% scaling
 
 MIN_PY = (3, 10)   # source uses `X | None` annotations — 3.9 exe would crash at startup
 
@@ -76,6 +77,14 @@ def run_pyinstaller() -> None:
         f"--icon={ICON}",
         # icon for future windows (about dialogs, map picker)
         f"--add-data={ICON};.",
+        # tkintermapview (map picker) pulls in geocoder, whose provider
+        # modules are imported dynamically — collect everything to be safe
+        "--collect-all", "tkintermapview",
+        "--collect-submodules", "geocoder",
+        # DPI awareness: the PyInstaller default manifest pins dpiAware=false,
+        # which virtualises the process on 4K/200% screens and shrinks the
+        # whole window to 1x. Our manifest opts into PerMonitorV2.
+        f"--manifest={MANIFEST}",
         "--clean",
         "--noconfirm",
         ENTRY,

@@ -919,8 +919,16 @@ class ExifCraft:
         sw, sh   = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         need_w   = self.root.winfo_reqwidth()
         need_h   = self.root.winfo_reqheight()
-        w = min(max(need_w + 16, 1020), sw - 60)
-        h = min(max(need_h + 20, 680),  sh - 90)
+        # DPI reality check (measured on a 4K/200% machine):
+        #   venv python.exe : screen 1920, scaling 1.33  (Windows virtualises)
+        #   packaged exe    : screen 3840, scaling 2.67  (manifest-aware)
+        # In the aware case winfo_reqwidth is already in physical pixels but
+        # the layout requests come out ~40% of what a crisp 2x render needs,
+        # so compensate by screen width. A virtualised process reports 1920
+        # and keeps k=1 — Windows itself scales the window up.
+        k        = max(1.0, sw / 1920.0)
+        w = min(max(int((need_w + 16) * k), 1020), int(sw * 0.8))
+        h = min(max(int((need_h + 20) * k), 680),  int(sh * 0.8))
         x = max(20, (sw - w) // 2)
         y = max(20, (sh - h) // 2 - 20)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
@@ -1149,15 +1157,43 @@ class ExifCraft:
                         variable=self.overwrite_var,
                         style="App.TCheckbutton").pack(side="left")
 
-        # --- right column
-        right = ttk.Frame(body, style="App.TFrame")
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        # --- right column: wrapped in a scrolling canvas.
+        # The right column's natural height (~1050 px with the larger
+        # preview) exceeds the usable body height on a 1080p screen —
+        # without scrolling, the packer squeezes the last cards (GPS!)
+        # down to nothing. See _on_mousewheel for the scroll routing.
+        right_scroll = tk.Canvas(body, bg=Theme.BG, highlightthickness=0, bd=0)
+        right_scroll.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right_sb = ttk.Scrollbar(body, orient="vertical",
+                                 style="Vertical.TScrollbar",
+                                 command=right_scroll.yview)
+        right_sb.grid(row=0, column=2, sticky="ns")
+        right_scroll.configure(yscrollcommand=right_sb.set)
+
+        right = ttk.Frame(right_scroll, style="App.TFrame")
+        right_window = right_scroll.create_window((0, 0), window=right,
+                                                  anchor="nw")
+        # kept on the instance: the wheel handler and tests both need them
+        self._right_scroll, self._right = right_scroll, right
+
+        def _sync_right_scroll(_e=None):
+            bbox = right_scroll.bbox("all")
+            if bbox:
+                right_scroll.configure(scrollregion=bbox)
+            # keep the inner frame exactly as wide as the viewport
+            right_scroll.itemconfigure(right_window,
+                                       width=right_scroll.winfo_width())
+
+        right.bind("<Configure>", _sync_right_scroll)
+        right_scroll.bind("<Configure>", _sync_right_scroll)
+
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
         # Preview card — visual confirmation of the selected file
         prev_card = Card(right, title="Preview  ·  预览")
         prev_card.pack(fill="x")
 
-        prev_box = tk.Frame(prev_card.body, bg=Theme.SURFACE_2, height=240)
+        prev_box = tk.Frame(prev_card.body, bg=Theme.SURFACE_2, height=320)
         prev_box.pack(fill="x")
         prev_box.pack_propagate(False)               # keep the box height fixed
         self._preview_lbl = tk.Label(
@@ -1358,6 +1394,50 @@ class ExifCraft:
         # plants the empty-state hint row (otherwise the list is a blank void)
         self._refresh_list()
 
+    # ------------------------------------------------------------------
+    #  Right-column scrolling
+    # ------------------------------------------------------------------
+    def _wheel_over_right(self, x_root: int, y_root: int) -> bool:
+        """True when a screen point lands inside the scrollable right column.
+
+        Walks the widget under the pointer up the parent chain, so a wheel
+        event over any card counts — not just the bare canvas.
+        """
+        w = self._right_scroll.winfo_containing(x_root, y_root)
+        while w is not None:
+            if w is self._right_scroll or w is self._right:
+                return True
+            w = w.master
+        return False
+
+    def _scroll_right_column(self, steps: int) -> bool:
+        """Scroll the right column by *steps* wheel-notches (down if > 0).
+
+        yview_scroll's "units" step depends on the canvas -scrollincrement
+        option (0 by default), so the moveto fraction is computed directly.
+        Returns False when the content already fits and cannot scroll.
+        """
+        bbox = self._right_scroll.bbox("all")
+        if not bbox:
+            return False
+        region = bbox[3] - bbox[1]
+        view = self._right_scroll.winfo_height()
+        if region <= view:
+            return False
+        top = self._right_scroll.yview()[0]
+        top = min(1.0, max(0.0, top + steps * 48.0 / region))
+        self._right_scroll.yview_moveto(top)
+        return True
+
+    def _on_mousewheel(self, event):
+        """Route the wheel to the right column only when the pointer is
+        over it — the file Listbox on the left keeps its native wheel
+        behaviour. Returns "break" when the event was consumed."""
+        if not self._wheel_over_right(event.x_root, event.y_root):
+            return
+        self._scroll_right_column(-1 if event.delta < 0 else 1)
+        return "break"
+
     def _labeled_entry(self, parent, label, var, *, hint=None, col=None, field=None):
         """Build a label + entry (+ optional hint) block. Returns its frame.
 
@@ -1450,11 +1530,15 @@ class ExifCraft:
             set_state(not get_state())
             _enter()                                     # re-evaluate hover colour
 
+        # NB: <Button-1> and <ButtonPress-1> are THE SAME Tk sequence —
+        # binding both means the second one replaces the first. The press
+        # handler must live on <ButtonRelease-1> so a click ends up as
+        # press → flip → release, not press → nothing.
         for w in (chip, mark, text):
-            w.bind("<Button-1>", _release)
+            w.bind("<ButtonPress-1>", _press)
+            w.bind("<ButtonRelease-1>", _release)
             w.bind("<Enter>", _enter)
             w.bind("<Leave>", _leave)
-            w.bind("<ButtonPress-1>", _press)
 
         chip._hover = False
         chip._hover_bg = Theme.SURFACE
@@ -1551,7 +1635,7 @@ class ExifCraft:
     # ------------------------------------------------------------------
     #  Preview rendering
     # ------------------------------------------------------------------
-    PREVIEW_MAX   = (360, 240)   # box size; images are contain-fit inside it
+    PREVIEW_MAX   = (640, 480)   # box size; images are contain-fit inside it
     PREVIEW_CACHE = 20           # LRU entries — bounds memory on big folders
 
     def _load_thumb_image(self, path: str):

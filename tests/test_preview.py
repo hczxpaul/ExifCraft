@@ -37,7 +37,8 @@ class TestThumbGeneration:
         p = jpeg_factory("big.jpg", size=(4000, 3000))
         img, size = app._load_thumb_image(str(p))
         assert size == (4000, 3000)              # meta reports the true size
-        assert img.width <= 360 and img.height <= 240
+        assert img.width <= app.PREVIEW_MAX[0]
+        assert img.height <= app.PREVIEW_MAX[1]
 
     def test_bad_file_raises(self, app, tmp_path):
         bad = tmp_path / "corrupt.jpg"

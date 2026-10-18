@@ -8,6 +8,8 @@ build/
 dist/
 *.spec
 *.manifest
+# ...but the DPI-awareness manifest IS a build input (build.py reads it)
+!ExifCraft.manifest
 *.log
 
 # ---- Tooling caches ----
