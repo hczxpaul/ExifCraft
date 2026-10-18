@@ -76,6 +76,13 @@ class Theme:
     # hints, placeholders and dimmed rows — 4.76:1 on white, 4.55:1 on SURFACE_2
     TEXT_3      = "#64748B"
 
+    # checkbox: soft style — both states keep a fill + border, so ticking
+    # only changes the border colour and reveals a tick (#94A3B8 used to
+    # leave the unchecked border at 2.56:1, below WCAG 1.4.11's 3:1)
+    CHECK_BG    = "#FFFFFF"
+    CHECK_ON_BG = "#DBEAFE"   # same as PRIMARY_S
+    CHECK_BORDER = "#64748B"  # 4.76:1 on white
+
     SUCCESS     = "#059669"
     ERROR       = "#DC2626"
     WARNING     = "#D97706"
@@ -810,7 +817,18 @@ class ExifCraft:
 
     def __init__(self, root: tk.Tk):
         self.root = root
+        # Tk's PhotoImage does not follow the DPI scale: 1 image pixel is
+        # always 1 Tk pixel. In the DPI-aware build a Tk pixel is a PHYSICAL
+        # pixel while fonts render at 2x, so a hard-coded 16px icon would
+        # look half-size on a 4K screen. Scale every hand-picked pixel value.
+        try:
+            self._ui_scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
+        except Exception:
+            self._ui_scale = 1.0
         self._apply_theme()
+        # the preview budget follows the same DPI scale (PhotoImage is not
+        # auto-scaled, so a 640px thumbnail would look tiny on a 4K screen)
+        self.PREVIEW_MAX = (self._px(640), self._px(480))
         root.title(f"{self.APP_NAME}  ·  {self.APP_TAG}")
         self.root.configure(bg=Theme.BG)
 
@@ -1041,7 +1059,7 @@ class ExifCraft:
         # visual rhythm; the checkbox lives in the tree column as an image.
         s.configure("Files.Treeview",
                     background=base.SURFACE, fieldbackground=base.SURFACE,
-                    foreground=base.TEXT, rowheight=28, borderwidth=0,
+                    foreground=base.TEXT, rowheight=self._px(28), borderwidth=0,
                     font=base.FONT_MONO)
         s.map("Files.Treeview",
               background=[("selected", base.PRIMARY_S)],
@@ -1151,8 +1169,8 @@ class ExifCraft:
         list_holder = ttk.Frame(src_card.body, style="CardInner.TFrame")
         list_holder.pack(fill="both", expand=True, pady=(8, 4))
 
-        self._icon_on  = self._check_icon(True)
-        self._icon_off = self._check_icon(False)
+        self._icon_on  = self._checkbox_icon(True)
+        self._icon_off = self._checkbox_icon(False)
 
         self.file_list = ttk.Treeview(
             list_holder, columns=("idx", "fmt", "status"),
@@ -1166,10 +1184,10 @@ class ExifCraft:
         self.file_list.heading("fmt", text="格式", anchor="w",
                                command=lambda: self._sort_by("fmt"))
         self.file_list.heading("status", text="状态", anchor="w")
-        self.file_list.column("#0",     width=200, stretch=True,  anchor="w")
-        self.file_list.column("idx",    width=42,  stretch=False, anchor="e")
-        self.file_list.column("fmt",    width=58,  stretch=False, anchor="w")
-        self.file_list.column("status", width=64,  stretch=False, anchor="w")
+        self.file_list.column("#0",     width=self._px(200), stretch=True,  anchor="w")
+        self.file_list.column("idx",    width=self._px(42),  stretch=False, anchor="e")
+        self.file_list.column("fmt",    width=self._px(58),  stretch=False, anchor="w")
+        self.file_list.column("status", width=self._px(64),  stretch=False, anchor="w")
 
         # row tags: ticked / unticked / failed — plus a zebra stripe that
         # only sets the background so the two can coexist on one row
@@ -1207,12 +1225,19 @@ class ExifCraft:
         ttk.Button(list_footer, text="全选", style="Subtle.TButton",
                    command=lambda: self._tick_all_files(True)).pack(side="right")
 
-        # options row
+        # options row — the same chip component as the field toggles, so the
+        # whole window speaks one checkbox language (it used to be a raw
+        # ttk.Checkbutton with a system-drawn box)
         opt_row = ttk.Frame(src_card.body, style="CardInner.TFrame")
         opt_row.pack(fill="x", pady=(8, 0))
-        ttk.Checkbutton(opt_row, text="Overwrite originals in-place",
-                        variable=self.overwrite_var,
-                        style="App.TCheckbutton").pack(side="left")
+        ow_chip, ow_render = self._make_toggle_chip(
+            opt_row, "Overwrite originals in-place",
+            lambda: self.overwrite_var.get(),
+            lambda v: self.overwrite_var.set(v))
+        ow_chip.pack(side="left")
+        ow_render()
+        # keep the chip in sync if the flag is ever changed in code
+        self.overwrite_var.trace_add("write", lambda *_a: ow_render())
 
         # --- right column: wrapped in a scrolling canvas.
         # The right column's natural height (~1050 px with the larger
@@ -1250,7 +1275,8 @@ class ExifCraft:
         prev_card = Card(right, title="Preview  ·  预览")
         prev_card.pack(fill="x")
 
-        prev_box = tk.Frame(prev_card.body, bg=Theme.SURFACE_2, height=320)
+        prev_box = tk.Frame(prev_card.body, bg=Theme.SURFACE_2,
+                            height=self._px(320))
         prev_box.pack(fill="x")
         prev_box.pack_propagate(False)               # keep the box height fixed
         self._preview_lbl = tk.Label(
@@ -1551,18 +1577,27 @@ class ExifCraft:
             (frame, render) — frame is already packed-free; call render()
             whenever the underlying state changes.
         """
-        chip = tk.Frame(parent, bg=Theme.SURFACE, cursor="hand2")
-        mark = tk.Label(chip, text="□", font=(Theme.FONT[0], Theme.FONT[1] + 2),
-                        bg=Theme.SURFACE, fg=Theme.TEXT_3)
-        mark.pack(side="left", padx=(7, 5))
+        # icons are created by _build; a chip built earlier would need them
+        # lazily (guards against ordering changes)
+        if self._icon_on is None:
+            self._icon_on  = self._checkbox_icon(True)
+            self._icon_off = self._checkbox_icon(False)
+
+        chip = tk.Frame(parent, bg=Theme.SURFACE, cursor="hand2",
+                        takefocus=True, highlightthickness=1,
+                        highlightbackground=Theme.SURFACE,
+                        highlightcolor=Theme.PRIMARY)
+        mark = tk.Label(chip,
+                        image=self._icon_on if get_state() else self._icon_off,
+                        bg=Theme.SURFACE, bd=0, highlightthickness=0)
+        mark.pack(side="left", padx=(7, 0))       # the icon carries its own gap
         text = tk.Label(chip, text=label, font=Theme.FONT_BOLD,
                         bg=Theme.SURFACE, fg=Theme.TEXT_3)
         text.pack(side="left", padx=(0, 7), pady=5)      # roomy click target
 
         def render(*_):
             on = bool(get_state())
-            mark.configure(text="■" if on else "□",
-                           fg=Theme.PRIMARY if on else Theme.TEXT_3)
+            mark.configure(image=self._icon_on if on else self._icon_off)
             text.configure(fg=Theme.TEXT if on else Theme.TEXT_3)
             chip.configure(bg=chip._hover_bg if getattr(chip, "_hover", False)
                            else Theme.SURFACE)
@@ -1596,6 +1631,18 @@ class ExifCraft:
             w.bind("<ButtonRelease-1>", _release)
             w.bind("<Enter>", _enter)
             w.bind("<Leave>", _leave)
+
+        # keyboard path: the frame takes focus (highlight ring) and toggles
+        # on space/enter, so the chip is not mouse-only
+        def _toggle_key(_e=None):
+            set_state(not get_state())
+            _enter()
+            return "break"
+
+        chip.bind("<space>", _toggle_key)
+        chip.bind("<Return>", _toggle_key)
+        mark.bind("<space>", _toggle_key)
+        text.bind("<space>", _toggle_key)
 
         chip._hover = False
         chip._hover_bg = Theme.SURFACE
@@ -1852,23 +1899,39 @@ class ExifCraft:
     TICK_ON, TICK_OFF = "■", "□"      # text marker (logs / tests)
     HINT_IID = "__hint__"             # empty-state row (never a real file)
 
-    @staticmethod
-    def _check_icon(on: bool) -> ImageTk.PhotoImage:
-        """18x18 rounded checkbox for the tree column.
+    def _px(self, n: float) -> int:
+        """Scale a design pixel value for the current DPI."""
+        return max(1, int(round(n * self._ui_scale)))
 
-        Drawn with Pillow instead of a unicode glyph so the box keeps an
-        exact size and colour regardless of the user's font. Two shared
-        images serve every row.
+    def _checkbox_icon(self, on: bool) -> ImageTk.PhotoImage:
+        """Rounded checkbox in the soft style — used by the table AND chips.
+
+        Selected:   soft blue fill + blue border + blue tick.
+        Unselected: white fill + grey border (4.76:1, WCAG 1.4.11 needs 3:1).
+
+        Both states keep the same "fill + border" structure, so toggling
+        changes the border colour and reveals a tick — instead of swapping
+        a solid saturated block for a one-pixel hairline, which is what made
+        the old chips look so harsh.
         """
-        im = Image.new("RGBA", (23, 18), (0, 0, 0, 0))   # 5px gap on the right
+        s   = self._px(16)
+        gap = self._px(5)                    # built-in gap to the label text
+        im = Image.new("RGBA", (s + gap, s), (0, 0, 0, 0))
         d = ImageDraw.Draw(im)
+        bw = max(1, round(s * 0.10))         # ~1.6px border at 16px
+        r  = max(2, round(s * 0.22))
+        box = (0, 0, s - 1, s - 1)
         if on:
-            d.rounded_rectangle((1, 1, 16, 16), radius=3, fill=Theme.PRIMARY)
-            d.line((5, 9, 8, 12), fill="#FFFFFF", width=2)
-            d.line((8, 12, 12, 5), fill="#FFFFFF", width=2)
+            d.rounded_rectangle(box, radius=r, fill=Theme.CHECK_ON_BG,
+                                outline=Theme.PRIMARY, width=bw)
+            tw = max(1, round(s * 0.10))
+            d.line((s * .28, s * .52, s * .42, s * .67),
+                   fill=Theme.PRIMARY, width=tw)
+            d.line((s * .42, s * .67, s * .73, s * .34),
+                   fill=Theme.PRIMARY, width=tw)
         else:
-            d.rounded_rectangle((1, 1, 16, 16), radius=3,
-                                fill=Theme.SURFACE, outline="#94A3B8", width=2)
+            d.rounded_rectangle(box, radius=r, fill=Theme.CHECK_BG,
+                                outline=Theme.CHECK_BORDER, width=bw)
         return ImageTk.PhotoImage(im)
 
     def _tick_marker(self, idx: int) -> str:
