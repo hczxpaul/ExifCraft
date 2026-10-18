@@ -16,15 +16,13 @@ import shutil
 import ctypes
 import tempfile
 import threading
-import io
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
-from fractions import Fraction
 from datetime import datetime
-from PIL import Image, ImageOps, ImageDraw, ImageTk, UnidentifiedImageError
+from PIL import Image, ImageOps, ImageDraw, ImageTk
 
 import piexif
 import exif_patch
@@ -114,176 +112,34 @@ class Theme:
 # =====================================================================
 #  EXIF helpers
 # =====================================================================
-def to_degrees(value: float):
-    # Standard DMS: parts are always non-negative; the sign lives in the
-    # N/S or E/W Ref tag. Keeping negative parts breaks third-party readers.
-    v = abs(value)
-    d = int(v)
-    m = int((v - d) * 60)
-    s = (v - d - m / 60) * 3600
-    return [(d, 1), (m, 1), _to_fraction(s)]
+# EXIF writing lives in exif_patch.py (byte-level, never re-encodes).
+# The old Pillow pipeline (to_degrees / set_exif_data / apply_exif /
+# apply_exif_fields) existed only to serve PNG/TIFF, which this tool no
+# longer handles: every supported file is a JPEG — plain or Live Photo.
 
 
-def _to_fraction(value: float):
-    f = Fraction(value).limit_denominator(1_000_000)
-    return (f.numerator, f.denominator)
+def write_exif_from_bytes(raw: bytes, dst_path: str, fields: dict) -> None:
+    """Rewrite only the EXIF tags in a JPEG; every other byte is copied.
 
-
-def set_exif_data(img_path, output_path, *, longitude, latitude, altitude,
-                  focal_length, aperture, iso,
-                  make, model, shot_date, overwrite=False):
-    """Write EXIF into a copy of *img_path* at *output_path*."""
-    try:
-        img = Image.open(img_path)
-    except UnidentifiedImageError:
-        raise ValueError(f"Unrecognized image: {os.path.basename(img_path)}")
-    apply_exif(img, output_path, longitude=longitude, latitude=latitude,
-               altitude=altitude, focal_length=focal_length, aperture=aperture,
-               iso=iso, make=make, model=model, shot_date=shot_date)
-
-
-def apply_exif(img, output_path, *, longitude, latitude, altitude,
-               focal_length, aperture, iso,
-               make, model, shot_date):
-    """Write EXIF from an already-opened PIL image to *output_path*.
-
-    Split out of set_exif_data so callers can load an image into memory first:
-    overwrite mode renames the source away before saving, so re-opening the
-    path inside would fail.
-
-    Full write: every field is replaced. For partial edits use
-    apply_exif_fields(), which only touches the keys you pass.
-    """
-    fields = {
-        "longitude": longitude, "latitude": latitude, "altitude": altitude,
-        "focal_length": focal_length, "aperture": aperture, "iso": iso,
-        "make": make, "model": model, "datetime": shot_date,
-    }
-    apply_exif_fields(img, output_path, fields)
-
-
-# name -> (IFD, tag, value kind)
-SIMPLE_FIELDS = {
-    "make":         ("0th",  piexif.ImageIFD.Make,             "str"),
-    "model":        ("0th",  piexif.ImageIFD.Model,            "str"),
-    "datetime":     ("Exif", piexif.ExifIFD.DateTimeOriginal,  "str"),
-    "focal_length": ("Exif", piexif.ExifIFD.FocalLength,       "rational"),
-    "aperture":     ("Exif", piexif.ExifIFD.FNumber,           "rational"),
-    "iso":          ("Exif", piexif.ExifIFD.ISOSpeedRatings,   "int"),
-}
-
-
-def apply_exif_fields(img, output_path, fields: dict, *, exif_dict=None):
-    """Write only the EXIF fields present in *fields*; everything else is kept.
-
-    Args:
-        img: an already-opened PIL image.
-        output_path: destination path.
-        fields: {field_name: value}. Absent key = leave the existing tag
-            untouched; value None = delete that tag ("clear this field").
-            Recognised names are the SIMPLE_FIELDS keys plus
-            "longitude" / "latitude" / "altitude" (GPS) and "clear_gps"
-            (True → drop the whole GPS block).
-        exif_dict: optional pre-loaded piexif dict (used by tests).
+    Both supported kinds take this one path: a plain JPG (nothing outside the
+    EXIF segment changes — the pixels are never re-encoded) and a Live Photo
+    (the XMP motion declaration, the MPF second image and the video appended
+    after EOI are copied verbatim; saving through Pillow drops all three).
 
     Raises:
-        ValueError: if a numeric field cannot be parsed.
-    """
-    if exif_dict is None:
-        if 'exif' in img.info:
-            exif_dict = piexif.load(img.info['exif'])
-        else:
-            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-
-    # ---- simple tags: only the keys we were given
-    for name, (ifd, tag, kind) in SIMPLE_FIELDS.items():
-        if name not in fields:
-            continue
-        value = fields[name]
-        if value is None:
-            exif_dict[ifd].pop(tag, None)
-            continue
-        if kind == "str":
-            exif_dict[ifd][tag] = str(value).encode("utf-8")
-        elif kind == "rational":
-            exif_dict[ifd][tag] = _to_fraction(float(value))
-        else:
-            exif_dict[ifd][tag] = int(value)
-
-    # ---- GPS: lat/lon carry a Ref tag, altitude is independent
-    if fields.get("clear_gps"):
-        exif_dict["GPS"] = {}            # verified safe: other IFDs untouched
-    else:
-        gps = exif_dict.setdefault("GPS", {})
-        for name, tag, ref_tag, pos_ref, neg_ref in (
-                ("latitude",  piexif.GPSIFD.GPSLatitude,
-                 piexif.GPSIFD.GPSLatitudeRef,  "N", "S"),
-                ("longitude", piexif.GPSIFD.GPSLongitude,
-                 piexif.GPSIFD.GPSLongitudeRef, "E", "W")):
-            if name not in fields:
-                continue
-            value = fields[name]
-            if value is None:
-                gps.pop(tag, None)
-                gps.pop(ref_tag, None)
-            else:
-                v = float(value)
-                gps[tag] = to_degrees(v)
-                gps[ref_tag] = pos_ref if v >= 0 else neg_ref
-
-        if "altitude" in fields:
-            value = fields["altitude"]
-            if value is None:
-                gps.pop(piexif.GPSIFD.GPSAltitude, None)
-                gps.pop(piexif.GPSIFD.GPSAltitudeRef, None)
-            else:
-                alt = float(value)
-                gps[piexif.GPSIFD.GPSAltitude] = _to_fraction(alt) if alt else (0, 1)
-                gps[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
-
-    exif_bytes = piexif.dump(exif_dict)
-    ext = os.path.splitext(output_path)[1].lower()
-    save_kwargs = {"exif": exif_bytes}
-    if ext in (".jpg", ".jpeg"):
-        save_kwargs["quality"] = 100
-    img.save(output_path, **save_kwargs)
-    return exif_dict
-
-
-def write_exif_from_bytes(raw: bytes, dst_path: str, fields: dict,
-                          ext: str | None = None) -> None:
-    """Rewrite EXIF in *raw* and save to *dst_path*; every other byte is kept.
-
-    The strategy is chosen from the file's actual bytes, not its extension:
-
-    * Live Photo -> byte-level patcher. This is what makes it survive: the
-      XMP motion declaration, an MPF second image and the video appended
-      after EOI are copied verbatim. Saving through Pillow instead drops all
-      three (a 7 MB motion photo came back as a 4.6 MB still).
-    * Plain JPEG -> the same patcher; nothing but the EXIF segment changes,
-      so the pixels are not re-encoded at all.
-    * PNG / TIFF -> Pillow path (no appended payload to protect).
-
-    Raises:
-        exif_patch.UnsupportedFormat: for non-JPEG containers.
+        exif_patch.UnsupportedFormat: when the bytes are not a JPEG.
         ValueError: when the post-write self check fails.
     """
-    kind = exif_patch.detect_kind(raw)
-    if kind in ("jpeg", "motion-jpeg"):
-        new = exif_patch.patch_exif_bytes(raw, fields)
-        problems = exif_patch.verify_patch(raw, new)
-        if problems:
-            raise ValueError("EXIF 写入自检失败：" + "；".join(problems))
-        with open(dst_path, "wb") as f:
-            f.write(new)
-        return
+    if exif_patch.detect_kind(raw) not in ("jpeg", "motion-jpeg"):
+        raise exif_patch.UnsupportedFormat(
+            f"{exif_patch.describe(raw)} 不是 JPEG，本工具只处理 JPG / Live Photo")
 
-    if kind in ("png", "tiff"):
-        with Image.open(io.BytesIO(raw)) as img:
-            apply_exif_fields(img, dst_path, fields)
-        return
-
-    raise exif_patch.UnsupportedFormat(f"{exif_patch.describe(raw)} 不支持写入")
+    new = exif_patch.patch_exif_bytes(raw, fields)
+    problems = exif_patch.verify_patch(raw, new)
+    if problems:
+        raise ValueError("EXIF 写入自检失败：" + "；".join(problems))
+    with open(dst_path, "wb") as f:
+        f.write(new)
 
 
 def read_exif_info(img_path):
@@ -852,7 +708,7 @@ class ExifCraft:
     APP_TAG    = "Professional EXIF Editor"
     APP_VER    = "2.1"
 
-    IMG_EXTS = (".jpg", ".jpeg", ".tiff", ".tif", ".png")
+    IMG_EXTS = (".jpg", ".jpeg")
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -2772,9 +2628,9 @@ class ExifCraft:
             # video that must be preserved.
             kind = exif_patch.detect_kind(raw_src)
 
-            def save_to(path, _raw=raw_src, _ext=ext):
+            def save_to(path, _raw=raw_src):
                 # partial write: only the keys in fields are touched
-                write_exif_from_bytes(_raw, path, fields, _ext)
+                write_exif_from_bytes(_raw, path, fields)
 
             rec = None
             if self.bm is not None:

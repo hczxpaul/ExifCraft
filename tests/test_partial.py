@@ -1,4 +1,6 @@
 """Tests for feature 2: partial (single-field) EXIF editing."""
+from pathlib import Path
+
 import piexif
 from PIL import Image
 
@@ -6,9 +8,8 @@ from conftest import ExifCraft
 
 
 def write_fields(mod, src, dst, fields):
-    """apply_exif_fields takes an OPENED image, not a path."""
-    with Image.open(str(src)) as img:
-        return mod.apply_exif_fields(img, str(dst), fields)
+    """Write through the production entry point (bytes in, bytes out)."""
+    mod.write_exif_from_bytes(Path(str(src)).read_bytes(), str(dst), fields)
 
 FULL = dict(
     longitude="114.05", latitude="22.54", altitude="12",
@@ -140,13 +141,15 @@ class TestRegressionFullWrite:
         assert info["latitude"] == "-23.500000"
         assert info["longitude"] == "-46.600000"
 
-    def test_set_exif_data_public_api_unchanged(self, mod, jpeg_factory, tmp_path):
+    def test_write_entry_point_takes_bytes(self, mod, jpeg_factory, tmp_path):
         src = jpeg_factory("pub.jpg")
         out = tmp_path / "pub_out.jpg"
-        mod.set_exif_data(src, str(out), longitude=114.05, latitude=22.54,
-                          altitude=12.0, focal_length=35.0, aperture=2.8,
-                          iso=200, make="NIKON", model="Z6 II",
-                          shot_date="2024:05:06 07:08:09")
+        mod.write_exif_from_bytes(
+            Path(str(src)).read_bytes(), str(out),
+            {"longitude": 114.05, "latitude": 22.54, "altitude": 12.0,
+             "focal_length": 35.0, "aperture": 2.8, "iso": 200,
+             "make": "NIKON", "model": "Z6 II",
+             "datetime": "2024:05:06 07:08:09"})
         info = mod.read_exif_info(str(out))
         assert info["make"] == "NIKON"
         assert info["datetime"] == "2024:05:06 07:08:09"

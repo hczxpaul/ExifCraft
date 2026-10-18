@@ -1,34 +1,41 @@
 """Baseline tests for the EXIF core — lock CURRENT behaviour before refactoring.
 
-These tests are the regression net for T11 (set_exif_data rework). The rework
-must keep every behaviour here intact, so they are written against the public
-API and never touch internals.
+These tests are the regression net for the EXIF core: full writes must land
+the values that read_exif_info() reports back, on every supported file.
 """
+from pathlib import Path
+
 import piexif
 import pytest
 from PIL import Image
 
+import exif_patch as ep
 from conftest import ExifCraft
 
 
-# ---------------------------------------------------------------- to_degrees
-class TestToDegrees:
-    def test_positive(self, mod):
-        dms = mod.to_degrees(22.541667)
+def _write(mod, src, dst, fields):
+    """Write through the production entry point (bytes in, bytes out)."""
+    mod.write_exif_from_bytes(Path(str(src)).read_bytes(), str(dst), fields)
+
+
+# ---------------------------------------------------------------- DMS
+class TestDms:
+    def test_positive(self):
+        dms = ep._dms(22.541667)
         assert dms[0] == (22, 1)
         assert dms[1] == (32, 1)
         assert dms[2][0] / dms[2][1] == pytest.approx(30.0, abs=0.01)
 
-    def test_exact_half_degree(self, mod):
+    def test_exact_half_degree(self):
         # 22.5 deg == 22 deg 30' 0" exactly — no float drift
-        assert mod.to_degrees(22.5) == [(22, 1), (30, 1), (0, 1)]
+        assert ep._dms(22.5) == [(22, 1), (30, 1), (0, 1)]
 
-    def test_zero(self, mod):
-        assert mod.to_degrees(0.0) == [(0, 1), (0, 1), (0, 1)]
+    def test_zero(self):
+        assert ep._dms(0.0) == [(0, 1), (0, 1), (0, 1)]
 
-    def test_negative_uses_positive_parts(self, mod):
+    def test_negative_uses_positive_parts(self):
         # standard DMS: parts non-negative, sign carried by the Ref tag
-        dms = mod.to_degrees(-33.5)
+        dms = ep._dms(-33.5)
         assert dms[0] == (33, 1)
         assert dms[1] == (30, 1)
 
@@ -37,7 +44,7 @@ class TestToDegrees:
 FULL = dict(
     longitude=114.054167, latitude=22.541667, altitude=12.0,
     focal_length=35.0, aperture=2.8, iso=200,
-    make="NIKON", model="Z6 II", shot_date="2024:05:06 07:08:09",
+    make="NIKON", model="Z6 II", datetime="2024:05:06 07:08:09",
 )
 
 
@@ -45,7 +52,7 @@ class TestSetExifFullWrite:
     def test_roundtrip_jpeg(self, mod, jpeg_factory, tmp_path):
         src = jpeg_factory("plain.jpg")
         dst = tmp_path / "out.jpg"
-        mod.set_exif_data(src, dst, overwrite=False, **FULL)
+        _write(mod, src, dst, FULL)
 
         info = mod.read_exif_info(dst)
         assert info["make"] == "NIKON"
@@ -61,21 +68,20 @@ class TestSetExifFullWrite:
     def test_copy_naming_convention(self, mod, jpeg_factory, tmp_path):
         src = jpeg_factory("holiday.jpg")
         dst = tmp_path / "out.jpg"
-        mod.set_exif_data(src, dst, overwrite=False, **FULL)
+        _write(mod, src, dst, FULL)
         # current API takes the dst path verbatim — caller builds the _exif name
         assert dst.exists() and src.exists()
 
     def test_overwrite_in_place(self, mod, jpeg_factory):
         src = jpeg_factory("inplace.jpg")
-        mod.set_exif_data(src, src, overwrite=True, **FULL)
+        _write(mod, src, src, FULL)
         info = mod.read_exif_info(src)
         assert info["model"] == "Z6 II"
 
     def test_gps_ref_west_south(self, mod, jpeg_factory, tmp_path):
         src = jpeg_factory("neg.jpg")
         dst = tmp_path / "neg_out.jpg"
-        mod.set_exif_data(src, dst, overwrite=False,
-                          **{**FULL, "longitude": -46.6, "latitude": -23.5})
+        _write(mod, src, dst, {**FULL, "longitude": -46.6, "latitude": -23.5})
         info = mod.read_exif_info(dst)
         assert info["longitude"] == "-46.600000"
         assert info["latitude"] == "-23.500000"
@@ -83,7 +89,7 @@ class TestSetExifFullWrite:
     def test_altitude_zero_writes_zero_tag(self, mod, jpeg_factory, tmp_path):
         src = jpeg_factory("alt0.jpg")
         dst = tmp_path / "alt0_out.jpg"
-        mod.set_exif_data(src, dst, overwrite=False, **{**FULL, "altitude": 0})
+        _write(mod, src, dst, {**FULL, "altitude": 0})
         info = mod.read_exif_info(dst)
         assert info["altitude"] == "0.0"
 
@@ -92,23 +98,15 @@ class TestSetExifFullWrite:
         # overwrites the fields it owns (current behaviour).
         src = jpeg_factory("hasgps.jpg", gps=True)
         dst = tmp_path / "hasgps_out.jpg"
-        mod.set_exif_data(src, dst, overwrite=False, **FULL)
+        _write(mod, src, dst, FULL)
         info = mod.read_exif_info(dst)
         assert info["longitude"] == "114.054167"  # overwritten with new value
-
-    def test_png_roundtrip(self, mod, png_factory, tmp_path):
-        src = png_factory("png.png", gps=False)
-        dst = tmp_path / "png_out.png"
-        mod.set_exif_data(src, dst, overwrite=False, **FULL)
-        info = mod.read_exif_info(dst)
-        assert info["model"] == "Z6 II"
-        assert info["latitude"] == "22.541667"
 
     def test_unrecognized_image_raises(self, mod, tmp_path):
         bad = tmp_path / "bad.jpg"
         bad.write_bytes(b"not an image at all")
-        with pytest.raises(ValueError, match="Unrecognized image"):
-            mod.set_exif_data(bad, tmp_path / "x.jpg", overwrite=False, **FULL)
+        with pytest.raises(ValueError):
+            mod.write_exif_from_bytes(bad.read_bytes(), tmp_path / "x.jpg", FULL)
 
 
 # ------------------------------------------------------------- read_exif_info
