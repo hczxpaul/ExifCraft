@@ -290,3 +290,27 @@ class TestQuickGroups:
         table_app._quick_group("gps")
         assert table_app.gps_clear.get() is False
         assert table_app.date_clear.get() is False
+
+
+class TestDefaults:
+    def test_nothing_selected_at_startup(self, app):
+        # opt-in model: a fresh window must not have every tag pre-ticked
+        assert not any(v.get() for v in app.write_flags.values())
+        assert app.date_flag.get() is False
+
+    def test_write_without_selection_is_rejected(self, app, no_dialogs):
+        app.input_files = []
+        assert app._collect_params() == {}
+
+
+class TestWheelDirection:
+    def test_wheel_back_scrolls_down(self, app):
+        # Windows: rolling the wheel towards you (-120) moves the view down
+        assert app._wheel_steps(-120) == 1
+
+    def test_wheel_forward_scrolls_up(self, app):
+        assert app._wheel_steps(120) == -1
+
+    def test_multiple_notches_keep_the_sign(self, app):
+        assert app._wheel_steps(-240) == 1
+        assert app._wheel_steps(360) == -1

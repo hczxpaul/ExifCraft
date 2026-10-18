@@ -19,6 +19,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from fractions import Fraction
 from datetime import datetime
@@ -848,6 +849,8 @@ class ExifCraft:
         self._import_order: list[str] = []          # order as loaded, for "no sort"
         self._grip_origin: tuple[int, int] | None = None   # preview drag session
         self._preview_box: tk.Frame | None = None
+        self._fit_after_id: str | None = None       # column auto-fit debounce
+        self._name_font = tkfont.Font(font=Theme.FONT_MONO)   # for measuring names
 
         # preview state: LRU cache (path -> PhotoImage) + the currently shown
         # image (kept alive on the instance so Tk never GCs it) + debounce id
@@ -889,7 +892,10 @@ class ExifCraft:
 
         # --- three-state editing: check = write this field, ✕ = clear it,
         #     unchecked = leave the file's existing value alone
-        self.write_flags = {n: tk.BooleanVar(value=True) for n in self.field_vars}
+        # Nothing is selected at startup: the user picks what to write (via a
+        # module preset or by ticking a field). A pre-selected field list made
+        # a stray click on Write EXIF try to write every tag at once.
+        self.write_flags = {n: tk.BooleanVar(value=False) for n in self.field_vars}
         self.clear_flags = {n: tk.BooleanVar(value=False) for n in self.field_vars}
         for n, v in self.field_vars.items():
             # typing anything cancels a pending "clear"
@@ -901,7 +907,7 @@ class ExifCraft:
         for n, flag in self.write_flags.items():
             flag.trace_add("write", lambda *a: self._refresh_fields_ui())
 
-        self.date_flag  = tk.BooleanVar(value=True)    # date participates?
+        self.date_flag  = tk.BooleanVar(value=False)   # date participates? (opt-in)
         self.date_clear = tk.BooleanVar(value=False)   # or gets removed?
         self.gps_clear  = tk.BooleanVar(value=False)   # drop the whole GPS block
 
@@ -1196,7 +1202,7 @@ class ExifCraft:
                                command=self._sort_by_name)
         self.file_list.heading("status", text="状态", anchor="w")
         self.file_list.column("#0",     width=self._px(36),  stretch=False, anchor="center")
-        self.file_list.column("name",   width=self._px(170), stretch=True,  anchor="w")
+        self.file_list.column("name",   width=self._px(170), stretch=False, anchor="w")
         self.file_list.column("status", width=self._px(62),  stretch=False, anchor="w")
 
         # row tags: ticked / unticked / failed — plus a zebra stripe that
@@ -1221,6 +1227,8 @@ class ExifCraft:
         self.file_list.bind("<ButtonRelease-1>", self._on_list_release)
         self.file_list.bind("<space>",           self._on_list_space)
         self.file_list.bind("<<TreeviewSelect>>", self._schedule_preview)
+        # keep the name column fitted to the longest file when the panel resizes
+        self.file_list.bind("<Configure>", self._schedule_fit_columns)
 
         # list footer: tick-all / untick-all / clear
         list_footer = ttk.Frame(src_card.body, style="CardInner.TFrame")
@@ -1568,13 +1576,20 @@ class ExifCraft:
         self._right_scroll.yview_moveto(top)
         return True
 
+    @staticmethod
+    def _wheel_steps(delta: int) -> int:
+        """Windows wheel convention: forward (+120) scrolls up, back (-120)
+        scrolls down. The sign used to be inverted, so the panel moved the
+        opposite way to every other Windows app."""
+        return 1 if delta < 0 else -1
+
     def _on_mousewheel(self, event):
         """Route the wheel to the right column only when the pointer is
-        over it — the file Listbox on the left keeps its native wheel
+        over it — the file list on the left keeps its native wheel
         behaviour. Returns "break" when the event was consumed."""
         if not self._wheel_over_right(event.x_root, event.y_root):
             return
-        self._scroll_right_column(-1 if event.delta < 0 else 1)
+        self._scroll_right_column(self._wheel_steps(event.delta))
         return "break"
 
     def _labeled_entry(self, parent, label, var, *, hint=None, col=None, field=None):
@@ -2145,6 +2160,7 @@ class ExifCraft:
                       values=("点击 File / Folder 选择图片", ""),
                       tags=("hint",))
             self._refresh_list_footer()
+            self._schedule_fit_columns()
             return
 
         self._refresh_status_index()
@@ -2163,9 +2179,38 @@ class ExifCraft:
             tv.selection_set(target)
             tv.focus(target)
             tv.see(target)
+        self._schedule_fit_columns()
         # Tk does not guarantee <<TreeviewSelect>> for a programmatic
         # selection — schedule the preview explicitly.
         self._schedule_preview()
+
+    def _fit_name_column(self) -> None:
+        """Size the filename column to the longest name, not to the panel.
+
+        It used to be stretch=True, so it always ate every spare pixel and
+        left a wide empty gutter right of short names. The width is now the
+        measured width of the longest basename plus cell padding, capped by
+        the space the panel really has.
+        """
+        self._fit_after_id = None
+        if not self.input_files:
+            self.file_list.column("name", width=self._px(170))
+            return
+        longest = max(self._name_font.measure(os.path.basename(p))
+                      for p in self.input_files)
+        pad  = self._px(14)                       # cell padding + breathing room
+        avail = (self.file_list.winfo_width()
+                 - self._px(36) - self._px(62) - self._px(4))
+        if avail < self._px(60):                  # widget not laid out yet
+            avail = longest + pad
+        width = max(self._px(80), min(longest + pad, max(self._px(80), avail)))
+        self.file_list.column("name", width=width)
+
+    def _schedule_fit_columns(self, _e=None) -> None:
+        """Coalesce resize events into a single measurement pass."""
+        if self._fit_after_id:
+            self.root.after_cancel(self._fit_after_id)
+        self._fit_after_id = self.root.after(80, self._fit_name_column)
 
     def _refresh_list_footer(self) -> None:
         n = len(self.input_files)
