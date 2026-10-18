@@ -2420,12 +2420,12 @@ class ExifCraft:
                 if not HAS_CALENDAR:
                     self.date_str_var.set(info["datetime"])
 
-        # ---- three-state flags after a read: everything visible is selected
-        # (what you see is what gets written), nothing is pending clearance
+        # ---- a read fills the input boxes and NOTHING else.
+        # It used to tick every non-empty field, which turned "open a file to
+        # look at its metadata" into "everything is queued to be rewritten".
+        # The user decides what gets written; a read is read-only.
         for name in self.field_vars:
             self.clear_flags[name].set(False)
-            self.write_flags[name].set(bool(self.field_vars[name].get().strip()))
-        self.date_flag.set(bool(info["datetime"]))
         self.date_clear.set(False)
         self.gps_clear.set(False)
         self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")

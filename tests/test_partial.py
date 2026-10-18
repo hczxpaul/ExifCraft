@@ -232,11 +232,17 @@ class TestReadBackFillsEverything:
         app._refresh_list()
         app._read_selected()
 
-        # after a read every non-empty field must be selected, none cleared
-        for name, var in app.field_vars.items():
-            if var.get().strip():
-                assert app.write_flags[name].get(), name
+        # a read fills the boxes but queues nothing for writing
+        assert not any(app.write_flags[name].get() for name in app.field_vars)
+        assert app.date_flag.get() is False
+        assert app.field_vars["make"].get() == "NIKON"        # value arrived
+        for name in app.field_vars:
             assert not app.clear_flags[name].get(), name
+
+        # the user then decides what to write
+        app._quick_group("all")
+        for name, var in app.field_vars.items():
+            assert app.write_flags[name].get(), name
         assert app.date_flag.get()
 
         out = tmp_path / "seeded_exif.jpg"
