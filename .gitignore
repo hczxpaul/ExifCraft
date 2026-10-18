@@ -48,3 +48,9 @@ htmlcov/
 desktop.ini
 Thumbs.db
 .DS_Store
+# ---- Local working notes ----
+# PLAN_*/BUG_* notes are process artifacts (plans, bug analysis), not project
+# docs. Features ship and bugs get fixed; these stay on disk as local history.
+# Only README.md belongs in the repo.
+PLAN_*.md
+BUG_*.md
