@@ -706,7 +706,7 @@ class Card(tk.Frame):
 class ExifCraft:
     APP_NAME   = "ExifCraft"
     APP_TAG    = "Professional EXIF Editor"
-    APP_VER    = "2.1"
+    APP_VER    = "2.1.1"
 
     IMG_EXTS = (".jpg", ".jpeg")
 
