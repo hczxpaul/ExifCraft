@@ -846,6 +846,8 @@ class ExifCraft:
         self._sort_col: str | None = None           # None = import order
         self._sort_rev: bool = False
         self._import_order: list[str] = []          # order as loaded, for "no sort"
+        self._grip_origin: tuple[int, int] | None = None   # preview drag session
+        self._preview_box: tk.Frame | None = None
 
         # preview state: LRU cache (path -> PhotoImage) + the currently shown
         # image (kept alive on the instance so Tk never GCs it) + debounce id
@@ -1036,6 +1038,16 @@ class ExifCraft:
               foreground=[("active", base.PRIMARY)],
               background=[("active", base.SURFACE)])
 
+        # compact variant for the quick-select row: five buttons must fit the
+        # right column even in a narrow window
+        s.configure("Quick.TButton",
+                    font=(base.FONT[0], max(8, base.FONT[1] - 1)),
+                    padding=(4, 3), foreground=base.TEXT_2,
+                    background=base.SURFACE, borderwidth=0, relief="flat")
+        s.map("Quick.TButton",
+              foreground=[("active", base.PRIMARY)],
+              background=[("active", base.SURFACE_2)])
+
         # Inputs
         s.configure("Field.TEntry",
                     fieldbackground=base.SURFACE, foreground=base.TEXT,
@@ -1162,10 +1174,12 @@ class ExifCraft:
         ttk.Button(row, text="Browse", style="Ghost.TButton",
                    command=self._pick_output).pack(side="left", padx=2)
 
-        # file list — a 5-column table: ☑ / # / 文件名 / 格式 / 状态.
-        # Every cell comes from memory (paths, tick flags, session journal);
-        # the table never stats or opens a file, so switching a 1000-file
-        # folder on a network drive stays instant.
+        # file list — three columns: ☑ / 文件名 / 状态.
+        # The checkbox needs the tree column (#0) because that is the only
+        # column Tk allows an image in; the filename therefore lives in the
+        # first data column. No row numbers, no format column: every cell
+        # here is either unique or actually changes (status), and the table
+        # is built purely from memory — it never stats or opens a file.
         list_holder = ttk.Frame(src_card.body, style="CardInner.TFrame")
         list_holder.pack(fill="both", expand=True, pady=(8, 4))
 
@@ -1173,21 +1187,17 @@ class ExifCraft:
         self._icon_off = self._checkbox_icon(False)
 
         self.file_list = ttk.Treeview(
-            list_holder, columns=("idx", "fmt", "status"),
+            list_holder, columns=("name", "status"),
             show="tree headings", selectmode="browse", height=8,
             style="Files.Treeview",
         )
-        self.file_list.heading("#0", text="文件", anchor="w",
-                               command=lambda: self._sort_by("name"))
-        self.file_list.heading("idx", text="#", anchor="e",
-                               command=lambda: self._sort_by(None))
-        self.file_list.heading("fmt", text="格式", anchor="w",
-                               command=lambda: self._sort_by("fmt"))
+        self.file_list.heading("#0", text="", anchor="center")
+        self.file_list.heading("name", text="文件", anchor="w",
+                               command=self._sort_by_name)
         self.file_list.heading("status", text="状态", anchor="w")
-        self.file_list.column("#0",     width=self._px(200), stretch=True,  anchor="w")
-        self.file_list.column("idx",    width=self._px(42),  stretch=False, anchor="e")
-        self.file_list.column("fmt",    width=self._px(58),  stretch=False, anchor="w")
-        self.file_list.column("status", width=self._px(64),  stretch=False, anchor="w")
+        self.file_list.column("#0",     width=self._px(36),  stretch=False, anchor="center")
+        self.file_list.column("name",   width=self._px(170), stretch=True,  anchor="w")
+        self.file_list.column("status", width=self._px(62),  stretch=False, anchor="w")
 
         # row tags: ticked / unticked / failed — plus a zebra stripe that
         # only sets the background so the two can coexist on one row
@@ -1271,6 +1281,22 @@ class ExifCraft:
 
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
+        # ---- quick selection sits at the TOP of the column: it decides
+        # which modules get written, and it must stay visible even when the
+        # preview is dragged taller. Grid (not pack) so the five buttons
+        # share the width evenly instead of the last one falling off.
+        quick = ttk.Frame(right, style="App.TFrame")
+        quick.pack(fill="x", pady=(0, 8))
+        ttk.Label(quick, text="快捷选择：", style="Hint.TLabel"
+                  ).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        for i, (key, label) in enumerate(
+                (("camera", "设备"), ("exposure", "曝光"),
+                 ("date", "时间"), ("gps", "GPS"), ("all", "全部"))):
+            quick.columnconfigure(i + 1, weight=1, uniform="quick")
+            ttk.Button(quick, text=label, style="Quick.TButton",
+                       command=lambda k=key: self._quick_group(k)
+                       ).grid(row=0, column=i + 1, sticky="ew", padx=(3, 0))
+
         # Preview card — visual confirmation of the selected file
         prev_card = Card(right, title="Preview  ·  预览")
         prev_card.pack(fill="x")
@@ -1278,12 +1304,51 @@ class ExifCraft:
         prev_box = tk.Frame(prev_card.body, bg=Theme.SURFACE_2,
                             height=self._px(320))
         prev_box.pack(fill="x")
-        prev_box.pack_propagate(False)               # keep the box height fixed
+        prev_box.pack_propagate(False)               # height is set explicitly
         self._preview_lbl = tk.Label(
             prev_box, text="选择文件以预览",
             bg=Theme.SURFACE_2, fg=Theme.TEXT_3, font=Theme.FONT,
         )
         self._preview_lbl.pack(fill="both", expand=True)
+        self._preview_box = prev_box
+
+        # drag handle under the box — drag up/down to resize the preview
+        grip = tk.Canvas(prev_card.body, height=self._px(13), bg=Theme.SURFACE,
+                        highlightthickness=0, bd=0, cursor="sb_v_double_arrow")
+        grip.pack(fill="x")
+
+        def _draw_grip(_e=None):
+            grip.delete("all")
+            cx = grip.winfo_width() // 2
+            cy = grip.winfo_height() // 2
+            step, r = self._px(6), max(1, self._px(1))
+            for i in (-1, 0, 1):
+                x = cx + i * step
+                grip.create_oval(x - r, cy - r, x + r, cy + r,
+                                 fill=Theme.BORDER_FOCUS, outline="")
+
+        grip.bind("<Configure>", _draw_grip)
+
+        def _grip_press(e):
+            self._grip_origin = (e.y_root, prev_box.winfo_height())
+
+        def _grip_drag(e):
+            if self._grip_origin is None:
+                return
+            y0, h0 = self._grip_origin
+            lo = self._px(140)                       # never collapse the box
+            hi = max(lo, self.root.winfo_height() - self._px(420))
+            prev_box.configure(height=max(lo, min(hi, h0 + (e.y_root - y0))))
+
+        def _grip_release(_e):
+            if self._grip_origin is None:
+                return
+            self._grip_origin = None
+            self._resize_preview_budget()            # re-decode at the new size
+
+        grip.bind("<ButtonPress-1>",   _grip_press)
+        grip.bind("<B1-Motion>",       _grip_drag)
+        grip.bind("<ButtonRelease-1>", _grip_release)
 
         self._preview_meta = ttk.Label(prev_card.body, text="", style="Hint.TLabel")
         self._preview_meta.pack(anchor="w", pady=(2, 0))
@@ -1365,15 +1430,6 @@ class ExifCraft:
                       style="Field.TEntry", font=Theme.FONT_MONO, width=24
                       ).grid(row=0, column=1, columnspan=3, sticky="we", padx=(8, 0), pady=2)
         row.columnconfigure(1, weight=1)
-
-        # ---- quick-selection row: the "batch edit GPS only" shortcut
-        quick = ttk.Frame(right, style="App.TFrame")
-        quick.pack(fill="x", pady=(8, 0))
-        ttk.Label(quick, text="快捷选择：", style="Hint.TLabel").pack(side="left")
-        ttk.Button(quick, text="仅改 GPS", style="Subtle.TButton",
-                   command=self._quick_gps_only).pack(side="left", padx=(4, 0))
-        ttk.Button(quick, text="全选字段", style="Subtle.TButton",
-                   command=self._quick_select_all).pack(side="left", padx=(4, 0))
 
         # GPS card (under exposure)
         gps_card = Card(right, title="Location  ·  GPS 坐标")
@@ -1673,20 +1729,70 @@ class ExifCraft:
                           fg=Theme.ERROR if self.clear_flags[name].get()
                           else Theme.TEXT_3)
 
-    def _quick_gps_only(self) -> None:
-        """One-click setup for the most common job: batch-edit GPS only."""
+    # which fields belong to which module button
+    FIELD_GROUPS = {
+        "camera":   ("make", "model"),
+        "exposure": ("focal_length", "aperture", "iso"),
+        "gps":      ("longitude", "latitude", "altitude"),
+    }
+    GROUP_TITLE = {"camera": "相机", "exposure": "曝光参数", "gps": "GPS 坐标"}
+
+    def _reset_clear_flags(self) -> None:
+        """Drop pending "delete this tag" marks when a preset is applied —
+        a preset says what to write, not what to remove."""
+        if self.gps_clear.get():
+            self.gps_clear.set(False)
+            self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
+        self.date_clear.set(False)
+
+    def _quick_group(self, group: str) -> None:
+        """Module presets, each undoable by a second click.
+
+        - camera / exposure / gps: if the whole group is already ticked the
+          group is unticked; otherwise ONLY this group is ticked, so one
+          click means "write this module and leave the rest untouched".
+        - date: flips the date row, nothing else.
+        - all:  ticks everything, or clears everything when it already is.
+        """
+        if group == "all":
+            everything = (all(v.get() for v in self.write_flags.values())
+                          and self.date_flag.get())
+            for v in self.write_flags.values():
+                v.set(not everything)
+            self.date_flag.set(not everything)
+            self._reset_clear_flags()
+            self._log("已取消全部字段。" if everything
+                      else "已勾选全部字段（含拍摄时间）。",
+                      "muted" if everything else "ok")
+            return
+
+        if group == "date":
+            on = not self.date_flag.get()
+            self.date_flag.set(on)
+            for v in self.write_flags.values():
+                v.set(False)
+            self._reset_clear_flags()
+            self._log("仅修改拍摄时间：其他字段保持原值。" if on
+                      else "已取消拍摄时间。", "ok" if on else "muted")
+            return
+
+        names = self.FIELD_GROUPS[group]
+        all_on = all(self.write_flags[n].get() for n in names)
         for n in self.field_vars:
-            self.write_flags[n].set(n in ("longitude", "latitude", "altitude"))
+            self.write_flags[n].set(n in names and not all_on)
         self.date_flag.set(False)
-        self.gps_clear.set(False)
-        self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
-        self._log("已切换为仅修改 GPS：其他字段将保持原文件中的值。", "ok")
+        self._reset_clear_flags()
+        title = self.GROUP_TITLE[group]
+        self._log(f"仅修改{title}：其他字段保持原值。" if not all_on
+                  else f"已取消{title}。", "ok" if not all_on else "muted")
+
+    def _quick_gps_only(self) -> None:
+        """Kept for programmatic callers — same as the GPS preset button."""
+        self._quick_group("gps")
 
     def _quick_select_all(self) -> None:
-        for n in self.field_vars:
-            self.write_flags[n].set(True)
-        self.date_flag.set(True)
-        self._log("已勾选全部字段（含拍摄时间）。", "muted")
+        """Kept for programmatic callers — same as the 全部 button."""
+        self._quick_group("all")
 
     def _clear_date(self) -> None:
         """Mark the capture time for removal (or undo that)."""
@@ -1742,6 +1848,21 @@ class ExifCraft:
     PREVIEW_MAX   = (640, 480)   # box size; images are contain-fit inside it
     PREVIEW_CACHE = 20           # LRU entries — bounds memory on big folders
 
+    def _preview_budget(self) -> tuple[int, int]:
+        """Decode budget = the LIVE size of the preview box.
+
+        Using a hard-coded figure (it used to be 640x480) meant landscape
+        shots were decoded wider than the column really is — the label then
+        cropped them at both sides. Reading the widget keeps the image
+        inside what the user can actually see, at any window size.
+        """
+        box = self._preview_box
+        if box is None:
+            return tuple(self.PREVIEW_MAX)
+        w = box.winfo_width() or self._px(420)
+        h = box.winfo_height() or self._px(320)
+        return (max(self._px(120), w), max(self._px(90), h))
+
     def _load_thumb_image(self, path: str):
         """Decode + downscale *path* into a PIL image ready for PhotoImage.
 
@@ -1752,20 +1873,35 @@ class ExifCraft:
         (huge on network drives); exif_transpose() fixes portrait shots;
         thumbnail() does the final contain-fit.
         """
+        budget = self._preview_budget()
         img = Image.open(path)
         w, h = img.size
         orient = img.getexif().get(0x0112, 1)      # 274 = Orientation
         if orient in (5, 6, 7, 8):                 # 90/270 deg rotations
             w, h = h, w
-        img.draft("RGB", self.PREVIEW_MAX)
+        img.draft("RGB", budget)
         img = ImageOps.exif_transpose(img)
-        img.thumbnail(self.PREVIEW_MAX)
+        img.thumbnail(budget)
         return img, (w, h)
 
     def _make_thumb(self, path: str):
         """Tk wrapper around _load_thumb_image."""
         img, size = self._load_thumb_image(path)
         return ImageTk.PhotoImage(img), size
+
+    def _resize_preview_budget(self) -> None:
+        """Re-fit the preview after the drag handle changed the box size.
+
+        The LRU cache holds PhotoImages decoded for the previous box, so the
+        current file's entry is dropped and decoded again at the new size.
+        """
+        self.PREVIEW_MAX = self._preview_budget()
+        idx = self._selected_index()
+        if idx is None:
+            return
+        path = self.input_files[idx]
+        self._preview_cache.pop(path, None)
+        self._show_preview(path)
 
     def _show_preview(self, path: str):
         if path in self._preview_cache:                    # cache hit: zero decode
@@ -1987,10 +2123,6 @@ class ExifCraft:
         self._set_row_state(idx)
 
     # ---- list construction ----------------------------------------------
-    @staticmethod
-    def _ext_of(path: str) -> str:
-        return os.path.splitext(path)[1].lstrip(".").upper() or "—"
-
     def _refresh_list(self):
         """Rebuild after a new folder/file selection: everything ticked."""
         self.file_checked = [True] * len(self.input_files)
@@ -2009,18 +2141,18 @@ class ExifCraft:
         if not self.input_files:
             # Empty state: a blank table reads as a broken panel.
             # TEXT_3 (#64748B) = 4.76:1 on white — WCAG AA body text.
-            tv.insert("", "end", iid=self.HINT_IID,
-                      text="点击 File / Folder 选择图片",
-                      values=("", "", ""), tags=("hint",))
+            tv.insert("", "end", iid=self.HINT_IID, text="",
+                      values=("点击 File / Folder 选择图片", ""),
+                      tags=("hint",))
             self._refresh_list_footer()
             return
 
         self._refresh_status_index()
         for i, f in enumerate(self.input_files):
             tv.insert("", "end", iid=str(i),
-                      text=os.path.basename(f),
+                      text="",                      # checkbox column
                       image=self._icon_on if self.file_checked[i] else self._icon_off,
-                      values=(str(i + 1), self._ext_of(f), self._status_text(i)),
+                      values=(os.path.basename(f), self._status_text(i)),
                       tags=(self._zebra(i), self._row_tag(i)))
 
         self._refresh_list_footer()
@@ -2047,27 +2179,31 @@ class ExifCraft:
         self.list_count_lbl.configure(text=text)
 
     # ---- column sorting (in-memory paths only) --------------------------
-    def _sort_by(self, col: str | None) -> None:
-        """Sort by name/fmt; clicking the same header flips the direction,
-        clicking '#' restores the import order."""
+    def _sort_by_name(self) -> None:
+        """Header click on 文件: ascending → descending → import order."""
         if not self.input_files:
             return
-        keep = self._selected_path()
-
-        if col is None:
-            self._sort_col, self._sort_rev = None, False
-        elif self._sort_col == col:
-            self._sort_rev = not self._sort_rev
+        if self._sort_col != "name":
+            self._sort_col, self._sort_rev = "name", False
+        elif not self._sort_rev:
+            self._sort_rev = True
         else:
-            self._sort_col, self._sort_rev = col, False
+            self._sort_col, self._sort_rev = None, False
+        self._apply_sort()
 
+    def _sort_by(self, col: str | None) -> None:
+        """Programmatic sort (callers / tests): "name" or None."""
+        if not self.input_files:
+            return
+        self._sort_col = "name" if col == "name" else None
+        self._sort_rev = False
+        self._apply_sort()
+
+    def _apply_sort(self) -> None:
+        keep = self._selected_path()
         pairs = list(zip(self.input_files, self.file_checked))
         if self._sort_col == "name":
             pairs.sort(key=lambda t: os.path.basename(t[0]).lower(),
-                       reverse=self._sort_rev)
-        elif self._sort_col == "fmt":
-            pairs.sort(key=lambda t: (os.path.splitext(t[0])[1].lower(),
-                                      os.path.basename(t[0]).lower()),
                        reverse=self._sort_rev)
         else:
             # true import order, not a re-sort of the paths
@@ -2093,17 +2229,14 @@ class ExifCraft:
         return None
 
     def _refresh_list_headers(self) -> None:
-        """Show ▲/▼ on the active sort column.
+        """Show ▲/▼ on the filename header while a name sort is active.
 
-        Import order (no explicit sort) shows no arrow — there is nothing
-        to indicate, and the marks would crowd the narrow columns.
+        Import order shows no arrow — there is nothing to indicate.
         """
-        active = {"name": "#0", "fmt": "fmt"}.get(self._sort_col or "")
-        for col, text in (("#0", "文件"), ("idx", "#"), ("fmt", "格式")):
-            mark = ""
-            if active and col == active:
-                mark = " ▼" if self._sort_rev else " ▲"
-            self.file_list.heading(col, text=text + mark)
+        mark = ""
+        if self._sort_col == "name":
+            mark = " ▼" if self._sort_rev else " ▲"
+        self.file_list.heading("name", text="文件" + mark)
 
     # ---- click / drag-to-sweep ------------------------------------------
     def _on_list_press(self, event):
