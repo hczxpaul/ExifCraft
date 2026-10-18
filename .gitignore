@@ -58,3 +58,9 @@ Thumbs.db
 # Only README.md belongs in the repo.
 PLAN_*.md
 BUG_*.md
+# Development screenshots: UI captures taken while building each feature
+# (checkbox style, empty state, 3-column layout, map picker...). Same nature
+# as the notes above — visual process records, referenced by nothing.
+# They slipped into the repo by riding along with feature commits on 10-17/18;
+# git history keeps them, the working copy stays on disk as local reference.
+screenshots/
