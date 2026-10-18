@@ -16,6 +16,7 @@ import shutil
 import ctypes
 import tempfile
 import threading
+import io
 from collections import OrderedDict
 from dataclasses import dataclass, asdict
 import tkinter as tk
@@ -26,6 +27,7 @@ from datetime import datetime
 from PIL import Image, ImageOps, ImageDraw, ImageTk, UnidentifiedImageError
 
 import piexif
+import exif_patch
 
 
 # ---------------------------------------------------------------------
@@ -246,6 +248,42 @@ def apply_exif_fields(img, output_path, fields: dict, *, exif_dict=None):
         save_kwargs["quality"] = 100
     img.save(output_path, **save_kwargs)
     return exif_dict
+
+
+def write_exif_from_bytes(raw: bytes, dst_path: str, fields: dict,
+                          ext: str | None = None) -> None:
+    """Rewrite EXIF in *raw* and save to *dst_path*; every other byte is kept.
+
+    The strategy is chosen from the file's actual bytes, not its extension:
+
+    * Live Photo -> byte-level patcher. This is what makes it survive: the
+      XMP motion declaration, an MPF second image and the video appended
+      after EOI are copied verbatim. Saving through Pillow instead drops all
+      three (a 7 MB motion photo came back as a 4.6 MB still).
+    * Plain JPEG -> the same patcher; nothing but the EXIF segment changes,
+      so the pixels are not re-encoded at all.
+    * PNG / TIFF -> Pillow path (no appended payload to protect).
+
+    Raises:
+        exif_patch.UnsupportedFormat: for non-JPEG containers.
+        ValueError: when the post-write self check fails.
+    """
+    kind = exif_patch.detect_kind(raw)
+    if kind in ("jpeg", "motion-jpeg"):
+        new = exif_patch.patch_exif_bytes(raw, fields)
+        problems = exif_patch.verify_patch(raw, new)
+        if problems:
+            raise ValueError("EXIF 写入自检失败：" + "；".join(problems))
+        with open(dst_path, "wb") as f:
+            f.write(new)
+        return
+
+    if kind in ("png", "tiff"):
+        with Image.open(io.BytesIO(raw)) as img:
+            apply_exif_fields(img, dst_path, fields)
+        return
+
+    raise exif_patch.UnsupportedFormat(f"{exif_patch.describe(raw)} 不支持写入")
 
 
 def read_exif_info(img_path):
@@ -2717,20 +2755,26 @@ class ExifCraft:
             else:
                 dst = os.path.join(out_dir, f"{name}_exif{ext}")
 
-            # Open (and fully decode, in overwrite mode) BEFORE any rename:
-            # safe_write moves the source away, so reading it afterwards fails.
+            # Read the whole file BEFORE any rename: safe_write moves the
+            # source away, so reading it afterwards fails. Working on bytes
+            # also lets the patcher copy the video trailer verbatim instead
+            # of re-encoding the JPEG.
             try:
-                img = Image.open(src)
-                if overwrite:
-                    img.load()
-            except Exception as e:
+                with open(src, "rb") as fh:
+                    raw_src = fh.read()
+            except OSError as e:
                 self.root.after(0, lambda b=base, m=str(e):
                                 self._log(f"{b} failed: {m}", "err"))
                 continue
 
-            def save_to(path, _img=img):
+            # Classify from the bytes, not the extension: a .jpg may be a
+            # plain photo or a Live Photo, and only the latter carries a
+            # video that must be preserved.
+            kind = exif_patch.detect_kind(raw_src)
+
+            def save_to(path, _raw=raw_src, _ext=ext):
                 # partial write: only the keys in fields are touched
-                apply_exif_fields(_img, path, fields)
+                write_exif_from_bytes(_raw, path, fields, _ext)
 
             rec = None
             if self.bm is not None:
@@ -2747,8 +2791,10 @@ class ExifCraft:
                 else:
                     save_to(dst)
                 success += 1
-                self.root.after(0, lambda b=base, d=os.path.basename(dst):
-                                self._log(f"{b}  →  {d}", "ok"))
+                note = ("  ·  Live Photo（视频已保留）"
+                        if kind == "motion-jpeg" else "")
+                self.root.after(0, lambda b=base, d=os.path.basename(dst), n=note:
+                                self._log(f"{b}  →  {d}{n}", "ok"))
             except Exception as e:
                 self.root.after(0, lambda b=base, m=str(e):
                                 self._log(f"{b} failed: {m}", "err"))
