@@ -69,15 +69,6 @@ class TestPathField:
         first, last = wide_app._src_entry.xview()
         assert first < 0.01 and last > 0.99
 
-    def test_overflow_shows_the_scrollbar(self, wide_app):
-        holder = wide_app._src_entry.master
-        wide_app.src_var.set(self.LONG)
-        wide_app.root.update()
-        assert len(holder.grid_slaves(row=1)) == 1
-        wide_app.src_var.set(r"D:\a.jpg")
-        wide_app.root.update()
-        assert len(holder.grid_slaves(row=1)) == 0
-
     def test_output_field_behaves_the_same(self, wide_app):
         wide_app.out_var.set(self.LONG)
         wide_app.root.update_idletasks()

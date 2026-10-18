@@ -314,3 +314,70 @@ class TestWheelDirection:
     def test_multiple_notches_keep_the_sign(self, app):
         assert app._wheel_steps(-240) == 1
         assert app._wheel_steps(360) == -1
+
+
+class TestTickOnlyFromTheBox:
+    """Ticking is opt-in: only the checkbox cell toggles a file."""
+
+    def test_click_on_name_only_selects(self, table_app, jpeg_factory):
+        _load(table_app, jpeg_factory, ["a.jpg", "b.jpg", "c.jpg"])
+        tv = table_app.file_list
+        y = _y(tv, "2")
+        tv.event_generate("<ButtonPress-1>", x=120, y=y)      # filename column
+        tv.event_generate("<ButtonRelease-1>", x=120, y=y)
+        table_app.root.update_idletasks()
+        assert table_app.file_checked == [True, True, True]   # untouched
+        assert tv.selection() == ("2",)                       # but selected
+
+    def test_click_on_status_only_selects(self, table_app, jpeg_factory):
+        _load(table_app, jpeg_factory, ["a.jpg", "b.jpg"])
+        tv = table_app.file_list
+        y = _y(tv, "1")
+        x = tv.winfo_width() - 20                             # status column
+        tv.event_generate("<ButtonPress-1>", x=x, y=y)
+        tv.event_generate("<ButtonRelease-1>", x=x, y=y)
+        table_app.root.update_idletasks()
+        assert table_app.file_checked == [True, True]
+        assert tv.selection() == ("1",)
+
+    def test_click_on_box_still_toggles(self, table_app, jpeg_factory):
+        _load(table_app, jpeg_factory, ["a.jpg", "b.jpg"])
+        tv = table_app.file_list
+        y = _y(tv, "0")
+        tv.event_generate("<ButtonPress-1>", x=10, y=y)       # checkbox column
+        tv.event_generate("<ButtonRelease-1>", x=10, y=y)
+        table_app.root.update_idletasks()
+        assert table_app.file_checked == [False, True]
+
+    def test_drag_from_name_still_sweeps(self, table_app, jpeg_factory):
+        # the sweep itself is unchanged: it works from any column
+        _load(table_app, jpeg_factory, ["a.jpg", "b.jpg", "c.jpg"])
+        tv = table_app.file_list
+        y0, y2 = _y(tv, "0"), _y(tv, "2")
+        tv.event_generate("<ButtonPress-1>", x=120, y=y0)
+        tv.event_generate("<B1-Motion>", x=120, y=y2)
+        tv.event_generate("<ButtonRelease-1>", x=120, y=y2)
+        table_app.root.update_idletasks()
+        assert table_app.file_checked == [False, False, False]
+
+    def test_space_still_toggles(self, table_app, jpeg_factory):
+        _load(table_app, jpeg_factory, ["a.jpg"])
+        table_app.file_list.selection_set("0")
+        table_app._on_list_space()
+        assert table_app.file_checked == [False]
+
+
+class TestHeaderSortingBothColumns:
+    def test_status_header_is_sortable(self, table_app):
+        # 状态 and 文件 share one ordering (by filename)
+        assert table_app.file_list.heading("status", "command")
+        assert table_app.file_list.heading("name", "command")
+
+    def test_status_header_cycles_the_same_order(self, table_app, jpeg_factory):
+        _load(table_app, jpeg_factory, ["c.jpg", "a.jpg", "b.jpg"])
+        cmd = table_app.file_list.heading("status", "command")
+        table_app.root.tk.call(cmd)                  # invoke it like a click
+        table_app.root.update_idletasks()
+        names = [os.path.basename(p) for p in table_app.input_files]
+        assert names == ["a.jpg", "b.jpg", "c.jpg"]
+        assert "▲" in table_app.file_list.heading("name", "text")

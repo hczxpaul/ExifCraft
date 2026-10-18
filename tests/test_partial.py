@@ -295,3 +295,53 @@ class TestBatchPartialEdit:
             assert info["latitude"] == ""               # GPS gone
             assert info["make"] == "NIKON"              # everything else intact
             assert info["datetime"] == "2024:05:06 07:08:09"
+
+
+class TestImportTemplate:
+    """A template photo lends its EXIF to the form — values only, no ticks."""
+
+    def _template(self, mod, jpeg_factory, tmp_path):
+        src = str(jpeg_factory("tpl.jpg"))
+        seeded = tmp_path / "tpl_full.jpg"
+        write_fields(mod, src, str(seeded), FULL)
+        return str(seeded)
+
+    def test_template_fills_the_form(self, app, mod, no_dialogs, jpeg_factory,
+                                     tmp_path, monkeypatch):
+        tpl = self._template(mod, jpeg_factory, tmp_path)
+        monkeypatch.setattr(mod.filedialog, "askopenfilename",
+                            lambda **kw: tpl)
+
+        app._import_template()
+
+        assert app.field_vars["make"].get() == "NIKON"
+        assert app.field_vars["model"].get() == "Z6 II"
+        assert app.field_vars["iso"].get() == "200"
+        assert app.field_vars["longitude"].get().startswith("114")
+
+    def test_template_does_not_tick_anything(self, app, mod, no_dialogs,
+                                             jpeg_factory, tmp_path, monkeypatch):
+        tpl = self._template(mod, jpeg_factory, tmp_path)
+        monkeypatch.setattr(mod.filedialog, "askopenfilename",
+                            lambda **kw: tpl)
+
+        app._import_template()
+
+        assert not any(v.get() for v in app.write_flags.values())
+        assert app.date_flag.get() is False
+        assert app._collect_params() == {}
+
+    def test_cancelled_dialog_changes_nothing(self, app, mod, no_dialogs, monkeypatch):
+        monkeypatch.setattr(mod.filedialog, "askopenfilename", lambda **kw: "")
+        before = {n: v.get() for n, v in app.field_vars.items()}
+        app._import_template()
+        assert {n: v.get() for n, v in app.field_vars.items()} == before
+
+    def test_unreadable_template_is_reported(self, app, mod, no_dialogs, tmp_path,
+                                             monkeypatch):
+        bad = tmp_path / "broken.jpg"
+        bad.write_bytes(b"definitely not an image")
+        monkeypatch.setattr(mod.filedialog, "askopenfilename",
+                            lambda **kw: str(bad))
+        app._import_template()          # showerror is swallowed by no_dialogs
+        assert app.field_vars["make"].get() == ""

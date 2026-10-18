@@ -1139,13 +1139,6 @@ class ExifCraft:
         s.map("Vertical.TScrollbar",
               background=[("active", base.BORDER_FOCUS), ("pressed", base.TEXT_3)])
 
-        # thin horizontal scrollbar used by the path fields; only shown when
-        # the path overflows, so it must not add height in the normal case
-        s.configure("Path.Horizontal.TScrollbar",
-                    background=base.BORDER, troughcolor=base.SURFACE,
-                    bordercolor=base.SURFACE, arrowcolor=base.TEXT_3,
-                    width=self._px(9))
-
         # Progressbar
         s.configure("Accent.Horizontal.TProgressbar",
                     troughcolor="#E9EEF6", background=base.PRIMARY,
@@ -1236,6 +1229,8 @@ class ExifCraft:
 
         btns = ttk.Frame(path_box, style="CardInner.TFrame")
         btns.pack(fill="x", pady=(3, 0))
+        ttk.Button(btns, text="模板 EXIF", style="Ghost.TButton",
+                   command=self._import_template).pack(side="right", padx=(4, 0))
         ttk.Button(btns, text="Folder", style="Ghost.TButton",
                    command=self._pick_folder).pack(side="right", padx=(4, 0))
         ttk.Button(btns, text="File",  style="Ghost.TButton",
@@ -1274,7 +1269,8 @@ class ExifCraft:
         self.file_list.heading("#0", text="", anchor="center")
         self.file_list.heading("name", text="文件", anchor="w",
                                command=self._sort_by_name)
-        self.file_list.heading("status", text="状态", anchor="w")
+        self.file_list.heading("status", text="状态", anchor="w",
+                               command=self._sort_by_name)
         self.file_list.column("#0",     width=self._px(36),  stretch=False, anchor="center")
         self.file_list.column("name",   width=self._px(170), stretch=False, anchor="w")
         self.file_list.column("status", width=self._px(62),  stretch=False, anchor="w")
@@ -1639,36 +1635,18 @@ class ExifCraft:
         return "break"
 
     def _path_entry(self, parent, var: tk.StringVar) -> ttk.Entry:
-        """Single-line path field: right aligned, tail first, scrollable.
+        """Single-line path field: right aligned, tail first.
 
         A media-library path is routinely 100+ characters and a plain Entry
         shows it from the left — exactly the part that never identifies the
-        file. This variant aligns right, scrolls to the end after every
-        change (so the filename is always visible), and only shows its
-        horizontal scrollbar when the text really overflows, so short paths
-        keep the compact single-row look.
+        file. This one right-aligns and scrolls to the end after every
+        change, so the filename is always visible. To reach the head, drag
+        inside the field: selecting text scrolls the view, which is all a
+        separate scrollbar would have bought.
         """
-        holder = ttk.Frame(parent, style="CardInner.TFrame")
-        holder.pack(side="left", fill="x", expand=True, padx=(8, 8))
-        holder.columnconfigure(0, weight=1)
-
-        entry = ttk.Entry(holder, textvariable=var, style="Field.TEntry",
+        entry = ttk.Entry(parent, textvariable=var, style="Field.TEntry",
                           font=Theme.FONT_MONO, width=1, justify="right")
-        entry.grid(row=0, column=0, sticky="ew")
-
-        hsb = ttk.Scrollbar(holder, orient="horizontal",
-                            style="Path.Horizontal.TScrollbar",
-                            command=entry.xview)
-
-        def _sync(first, last):
-            hsb.set(first, last)
-            overflow = float(first) > 0.001 or float(last) < 0.999
-            if overflow and not hsb.winfo_ismapped():
-                hsb.grid(row=1, column=0, sticky="ew", pady=(2, 0))
-            elif not overflow and hsb.winfo_ismapped():
-                hsb.grid_remove()
-
-        entry.configure(xscrollcommand=_sync)
+        entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
         var.trace_add("write", lambda *_a: self._scroll_path_to_tail(entry))
         self.root.after_idle(lambda: self._scroll_path_to_tail(entry))
         return entry
@@ -2358,7 +2336,11 @@ class ExifCraft:
 
     # ---- column sorting (in-memory paths only) --------------------------
     def _sort_by_name(self) -> None:
-        """Header click on 文件: ascending → descending → import order."""
+        """Header click (on 文件 or 状态): name ascending → descending → import.
+
+        Both headers drive the same cycle — the ordering is by filename, so
+        the arrow is drawn on the 文件 header either way.
+        """
         if not self.input_files:
             return
         if self._sort_col != "name":
@@ -2418,14 +2400,19 @@ class ExifCraft:
 
     # ---- click / drag-to-sweep ------------------------------------------
     def _on_list_press(self, event):
-        """Remember the drag origin. Deliberately does NOT return 'break':
-        Treeview moves the selection, so the preview follows the cursor."""
+        """Remember the drag origin. Deliberately does NOT return "break":
+        Treeview moves the selection, so the preview follows the cursor.
+
+        The column only matters for a click without movement — a sweep works
+        from anywhere, exactly as before.
+        """
         iid = self.file_list.identify_row(event.y)
         if not iid or iid == self.HINT_IID:
             self._drag = None
             return
         self._drag = {
             "from": iid,
+            "col": self.file_list.identify_column(event.x),
             "value": not self.file_checked[int(iid)],   # fixed target, not a toggle
             # empty on purpose: the first motion repaints the origin row too
             # (a sweep is inclusive of where it started, a plain click is not)
@@ -2453,7 +2440,10 @@ class ExifCraft:
     def _on_list_release(self, event):
         d, self._drag = self._drag, None
         if d and not d["moved"]:
-            self._toggle_file_tick(int(d["from"]))      # plain click
+            # a click that never moved: only the checkbox cell toggles, while
+            # the filename / status cells just select the row (preview follows)
+            if d.get("col") == "#0":
+                self._toggle_file_tick(int(d["from"]))
         elif d:
             self._refresh_list_footer()                 # one refresh per sweep
         return "break"
@@ -2519,19 +2509,13 @@ class ExifCraft:
     # ------------------------------------------------------------------
     #  Read existing EXIF
     # ------------------------------------------------------------------
-    def _read_selected(self):
-        # _selected_index() already rejects the empty-state hint row
-        idx = self._selected_index()
-        if idx is None:
-            messagebox.showinfo(self.APP_NAME, "Select a file from the list first.")
-            return
-        path = self.input_files[idx]
-        try:
-            info = read_exif_info(path)
-        except Exception as e:
-            messagebox.showerror(self.APP_NAME, f"Failed to read EXIF:\n{e}")
-            return
+    def _fill_form_from_info(self, info: dict) -> None:
+        """Put an EXIF dict into the form. Fills values only — never ticks.
 
+        A read (from the selected file or from a template) is informational;
+        what gets written stays the user's choice, so this deliberately does
+        not touch write_flags / date_flag.
+        """
         self.field_vars["longitude"].set(info["longitude"])
         self.field_vars["latitude"].set(info["latitude"])
         self.field_vars["altitude"].set(info["altitude"])
@@ -2553,10 +2537,7 @@ class ExifCraft:
                 if not HAS_CALENDAR:
                     self.date_str_var.set(info["datetime"])
 
-        # ---- a read fills the input boxes and NOTHING else.
-        # It used to tick every non-empty field, which turned "open a file to
-        # look at its metadata" into "everything is queued to be rewritten".
-        # The user decides what gets written; a read is read-only.
+        # a read clears any pending "delete this tag" marks
         for name in self.field_vars:
             self.clear_flags[name].set(False)
         self.date_clear.set(False)
@@ -2564,7 +2545,44 @@ class ExifCraft:
         self.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
         self._refresh_fields_ui()
 
+    def _read_selected(self):
+        # _selected_index() already rejects the empty-state hint row
+        idx = self._selected_index()
+        if idx is None:
+            messagebox.showinfo(self.APP_NAME, "Select a file from the list first.")
+            return
+        path = self.input_files[idx]
+        try:
+            info = read_exif_info(path)
+        except Exception as e:
+            messagebox.showerror(self.APP_NAME, f"Failed to read EXIF:\n{e}")
+            return
+
+        self._fill_form_from_info(info)
         self._log(f"Loaded EXIF from {os.path.basename(path)}", "ok")
+
+    def _import_template(self) -> None:
+        """Pick any photo and adopt its EXIF as the standard for this batch.
+
+        Unlike Read EXIF this file does not have to be in the list — the
+        point is to copy the settings from a reference shot.
+        """
+        p = filedialog.askopenfilename(
+            title="选择模板照片（导入它的 EXIF）",
+            filetypes=[("Images", " ".join(f"*{e}" for e in self.IMG_EXTS)),
+                       ("All files", "*.*")])
+        if not p:
+            return
+        try:
+            info = read_exif_info(p)
+        except Exception as e:
+            messagebox.showerror(self.APP_NAME, f"无法读取模板照片：\n{e}")
+            return
+
+        self._fill_form_from_info(info)
+        filled = sum(1 for v in self.field_vars.values() if v.get().strip())
+        self._log(f"已导入模板 {os.path.basename(p)}：{filled} 个字段已填值"
+                  f"（未勾选，请用快捷选择或手动勾选要写入的项）。", "ok")
 
     # ------------------------------------------------------------------
     #  Map picker
