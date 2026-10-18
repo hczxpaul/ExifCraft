@@ -1,5 +1,5 @@
 """
-ExifCraft  ·  build script
+ExifCraft-X  ·  build script
 Package ExifCraft.pyw into a single-file Windows executable with PyInstaller.
 
 Usage:
@@ -8,8 +8,8 @@ Usage:
     python build.py --no-zip   # build only, skip the zip bundle
 
 Output:
-    dist/ExifCraft.exe
-    dist/ExifCraft_vX.Y_win_x64.zip
+    dist/ExifCraft-X.exe
+    dist/ExifCraft-X_vX.Y_win_x64.zip
 """
 
 import os
@@ -22,7 +22,7 @@ import argparse
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(APP_DIR)
 
-APP_NAME  = "ExifCraft"
+APP_NAME  = "ExifCraft-X"
 ENTRY     = "ExifCraft.pyw"
 ICON      = "ExifCraft.ico"
 MANIFEST  = "ExifCraft.manifest"   # DPI awareness for 4K / 200% scaling
@@ -104,7 +104,7 @@ def make_zip() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build ExifCraft executable")
+    parser = argparse.ArgumentParser(description="Build ExifCraft-X executable")
     parser.add_argument("--no-zip", action="store_true",
                         help="skip creating the zip bundle")
     args = parser.parse_args()

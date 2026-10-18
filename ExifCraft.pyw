@@ -1,5 +1,5 @@
 """
-ExifCraft  ·  Professional EXIF Editor
+ExifCraft-X  ·  Professional EXIF Editor
 A clean, modern tool for reading & writing image metadata.
 
 Author : yohoten
@@ -381,7 +381,7 @@ class BackupManager:
                 return d
             except OSError:
                 continue
-        raise RuntimeError("no writable location for ExifCraft session data")
+        raise RuntimeError("no writable location for ExifCraft-X session data")
 
     # ------------------------------------------------------------------
     #  Journal
@@ -704,7 +704,7 @@ class Card(tk.Frame):
 #  Main application
 # =====================================================================
 class ExifCraft:
-    APP_NAME   = "ExifCraft"
+    APP_NAME   = "ExifCraft-X"
     APP_TAG    = "Professional EXIF Editor"
     APP_VER    = "2.1.1"
 
@@ -819,7 +819,7 @@ class ExifCraft:
     #  Window icon
     # ------------------------------------------------------------------
     def _apply_icon(self, window):
-        """Put the ExifCraft icon on any Tk window (title bar + taskbar)."""
+        """Put the ExifCraft-X icon on any Tk window (title bar + taskbar)."""
         # Windows: a multi-resolution .ico stays sharp at every shell size.
         # NB: the path must be positional — `default=` only seeds *future*
         # windows and leaves this one with Tk's stock feather icon.
@@ -905,7 +905,7 @@ class ExifCraft:
     # ------------------------------------------------------------------
     def _apply_theme(self):
         # ttk styles belong to the Tcl interpreter, not to this window. Building
-        # a second ExifCraft on the same root (the test suite does it hundreds
+        # a second ExifCraft-X on the same root (the test suite does it hundreds
         # of times) would otherwise re-configure every style and make
         # tkcalendar rebuild its own — measured 0.5s for nothing.
         if getattr(self.root, "_exifcraft_themed", False):

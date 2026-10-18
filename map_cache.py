@@ -223,7 +223,7 @@ def build_widget_class():
                    .replace("{z}", str(zoom)))
             try:
                 resp = requests.get(url, timeout=self.REQUEST_TIMEOUT,
-                                    headers={"User-Agent": "ExifCraft/2.1"})
+                                    headers={"User-Agent": "ExifCraft-X/2.1.1"})
                 resp.raise_for_status()
                 data = resp.content
             except Exception:

@@ -1,10 +1,12 @@
-# ExifCraft · Professional EXIF Editor
+# ExifCraft-X · Professional EXIF Editor
 
 **v2.1.1** — 一个干净、现代的图片元数据（EXIF）读写工具，面向**批量处理**设计。
 
-ExifCraft 是纯 Python 桌面应用，基于 Tkinter，无需浏览器、无需大型框架。它可以给一整个文件夹的照片批量写入 GPS 坐标、相机信息、曝光参数和拍摄时间，并把结果导出为 CSV。
+**ExifCraft-X** 是纯 Python 桌面应用，基于 Tkinter，无需浏览器、无需大型框架。它可以给一整个文件夹的照片批量写入 GPS 坐标、相机信息、曝光参数和拍摄时间，并把结果导出为 CSV。
 
 处理时遵循两条「只」：**只处理你勾选的文件，只写入你勾选的字段**。
+
+> **ExifCraft-X** 是基于 [yohoten/ExifCraft](https://github.com/yohoten/ExifCraft) 的衍生版本，沿用了原项目的架构与 MIT 许可证；原始版权归 yohoten 所有。 这个版本在其基础上扩展了批量处理、字段级三态写入、Live Photo 安全写入等能力。
 
 ![preview](preview.png)
 
@@ -162,7 +164,7 @@ python ExifCraft.pyw
 ## 📦 打包发布
 
 ```bash
-python build.py          # 产出 dist/ExifCraft.exe 与带版本号的 zip
+python build.py          # 产出 dist/ExifCraft-X.exe 与带版本号的 zip
 ```
 
 或直接用 PyInstaller：
@@ -174,7 +176,7 @@ pyinstaller --onefile --windowed --icon ExifCraft.ico ExifCraft.pyw
 ## 🗂 项目结构
 
 ```
-ExifCraft/
+ExifCraft-X/
 ├── ExifCraft.pyw     # 主程序（UI + 批量写入流程）
 ├── exif_patch.py     # 字节级 EXIF 写入：只改目标字段，不重新编码像素
 ├── map_cache.py      # 地图瓦片的 SQLite 缓存与 LRU 淘汰
@@ -188,3 +190,15 @@ ExifCraft/
 ## 📄 许可证
 
 [MIT](LICENSE) © yohoten, hczxpaul
+
+## 🙏 关于与致谢
+
+本项目衍生自 yohoten 的开源项目 [**ExifCraft**](https://github.com/yohoten/ExifCraft)，MIT 许可证下的原始版权仍归 yohoten 所有。
+
+| | |
+|---|---|
+| 上游项目 | [yohoten/ExifCraft](https://github.com/yohoten/ExifCraft) |
+| 上游作者 | yohoten |
+| 本版本 | ExifCraft-X（hczxpaul 维护） |
+
+主要扩展：批量处理流程与勾选模型、字段级三态写入、模板 EXIF 导入、Live Photo 字节级写入、地图瓦片缓存、实时状态反馈。
