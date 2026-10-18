@@ -904,6 +904,13 @@ class ExifCraft:
     #  Theming
     # ------------------------------------------------------------------
     def _apply_theme(self):
+        # ttk styles belong to the Tcl interpreter, not to this window. Building
+        # a second ExifCraft on the same root (the test suite does it hundreds
+        # of times) would otherwise re-configure every style and make
+        # tkcalendar rebuild its own — measured 0.5s for nothing.
+        if getattr(self.root, "_exifcraft_themed", False):
+            return
+        self.root._exifcraft_themed = True
         style = ttk.Style()
         # 'clam' is the most styleable cross-platform theme.
         try:
@@ -2532,16 +2539,19 @@ class ExifCraft:
         m.set_position(lat, lon)
         m.set_zoom(8)
 
-        info = ttk.Label(win, text="Click anywhere on the map to pick coordinates",
+        info = ttk.Label(win, text="点击地图选择位置，然后点右下角「确认」",
                          style="Subtitle.TLabel")
         info.pack(pady=(0, 8))
 
+        # A click only previews: the coordinates move into the form when the
+        # user confirms, so a stray tap can be undone by closing the window.
+        picked = {"coords": None}
+
         def on_click(coords):
             la, lo = coords
+            picked["coords"] = (la, lo)
             info.configure(text=f"Latitude: {la:.6f}   Longitude: {lo:.6f}")
-            self.field_vars["latitude"].set(f"{la:.6f}")
-            self.field_vars["longitude"].set(f"{lo:.6f}")
-            self._log(f"Map pick: {la:.6f}, {lo:.6f}", "muted")
+            self._log(f"地图预览：{la:.6f}, {lo:.6f}", "muted")
 
         m.add_left_click_map_command(on_click)
 
@@ -2566,6 +2576,15 @@ class ExifCraft:
                 self._map_win = None
                 win.destroy()
 
+        def confirm():
+            coords = picked["coords"]
+            if coords is not None:
+                la, lo = coords
+                self.field_vars["latitude"].set(f"{la:.6f}")
+                self.field_vars["longitude"].set(f"{lo:.6f}")
+                self._log(f"已采用地图坐标：{la:.6f}, {lo:.6f}", "ok")
+            close()
+
         win.protocol("WM_DELETE_WINDOW", close)
 
         bar = ttk.Frame(win, style="App.TFrame")
@@ -2589,10 +2608,12 @@ class ExifCraft:
         refresh_stats()
         win.after(1500, refresh_stats)      # after the first tiles land
 
-        ttk.Button(bar, text="Close", style="Ghost.TButton",
-                   command=close).pack(side="right")
+        # cache housekeeping sits with the cache readout, well away from the
+        # action button
         ttk.Button(bar, text="清理缓存", style="Subtle.TButton",
-                   command=clear_cache).pack(side="right", padx=(0, 6))
+                   command=clear_cache).pack(side="left", padx=(10, 0))
+        ttk.Button(bar, text="确认", style="Ghost.TButton",
+                   command=confirm).pack(side="right")
 
     # ------------------------------------------------------------------
     #  Writing (off the UI thread)
@@ -2823,28 +2844,16 @@ class ExifCraft:
     #  Lifecycle
     # ------------------------------------------------------------------
     def _on_close(self):
-        """Exit flow: offer rollback, then always release the backups."""
-        if self.bm is not None and self.bm.recs:
-            n = self.bm.backup_count()
-            mb = self.bm.backup_bytes() / 1024 / 1024
-            choice = messagebox.askyesnocancel(
-                self.APP_NAME,
-                f"本次会话已修改 {len(self.bm.recs)} 个文件"
-                f"（备份 {n} 个 / {mb:.1f} MB）。\n\n"
-                f"【是】撤销全部修改并退出\n"
-                f"【否】保留修改，删除备份并退出\n"
-                f"【取消】返回程序")
-            if choice is None:                       # cancel: stay
-                return
-            if choice:                               # yes: roll back
-                done, skipped = self.bm.rollback()
-                self._log(f"退出前回滚：还原 {done} 项"
-                          + (f"，跳过 {len(skipped)} 项" if skipped else ""),
-                          "ok" if done and not skipped else "warn")
-                if skipped:
-                    messagebox.showwarning(
-                        self.APP_NAME,
-                        f"{len(skipped)} 个文件在修改后被外部改动，未回滚（备份保留在原目录）。")
+        """Exit silently: closing the window means "keep what I did".
+
+        Every write is already committed to disk, and the Rollback button is
+        right there for anyone who wants to undo it. Asking on exit whether to
+        roll everything back confused people into undoing work they meant to
+        keep — especially in copy mode, where there is nothing to undo anyway.
+        """
+        self._shutdown()
+
+    def _shutdown(self) -> None:
         if self.bm is not None:
             self.bm.cleanup()                        # backups + journal gone
         try:

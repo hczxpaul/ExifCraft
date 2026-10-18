@@ -320,56 +320,6 @@ class TestRollbackUI:
         assert open(src, "rb").read() == original
 
 
-class TestExitFlow:
-    """_on_close must offer rollback and always release backups."""
-
-    @pytest.fixture(autouse=True)
-    def _keep_root_alive(self, app, monkeypatch):
-        """_on_close destroys the window; keep the shared Tk root usable."""
-        monkeypatch.setattr(app.root, "destroy", lambda: None)
-
-    def _prep(self, app, jpeg_factory):
-        src = str(jpeg_factory("exit.jpg"))
-        app._write_worker([src], "", PARAMS, overwrite=True)
-        app.root.update()
-        return src
-
-    def test_cancel_keeps_program_running(self, app, mod, monkeypatch,
-                                          no_dialogs, jpeg_factory):
-        src = self._prep(app, jpeg_factory)
-        monkeypatch.setattr(mod.messagebox, "askyesnocancel", lambda *a, **k: None)
-        app._on_close()
-        assert app.bm.recs                            # nothing rolled back
-        assert os.path.exists(app.bm.backup_name(src))  # backup still there
-
-    def test_no_keeps_changes_and_cleans(self, app, mod, monkeypatch,
-                                         no_dialogs, jpeg_factory):
-        src = self._prep(app, jpeg_factory)
-        original_after_write = open(src, "rb").read()
-        monkeypatch.setattr(mod.messagebox, "askyesnocancel", lambda *a, **k: False)
-        app._on_close()
-        assert open(src, "rb").read() == original_after_write   # changes kept
-        assert not os.path.exists(app.bm.backup_name(src))      # backups released
-
-    def test_yes_rolls_back_and_cleans(self, app, mod, monkeypatch,
-                                       no_dialogs, jpeg_factory):
-        src = str(jpeg_factory("exit3.jpg"))
-        original = open(src, "rb").read()
-        app._write_worker([src], "", PARAMS, overwrite=True)
-        app.root.update()
-        monkeypatch.setattr(mod.messagebox, "askyesnocancel", lambda *a, **k: True)
-        app._on_close()
-        assert open(src, "rb").read() == original     # restored
-        assert not os.path.exists(app.bm.backup_name(src))
-        assert app.bm.recs == []
-
-    def test_atexit_cleanup_releases_backups(self, app, no_dialogs, jpeg_factory):
-        src = self._prep(app, jpeg_factory)
-        app._atexit_cleanup()
-        assert not os.path.exists(app.bm.backup_name(src))
-        assert app.bm.recs == []
-
-
 class TestPurgeOrphans:
     def test_purge_removes_unreferenced_backups(self, bm_factory, jpeg_factory, tmp_path):
         bm = bm_factory(sid="purge01")

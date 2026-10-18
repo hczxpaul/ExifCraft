@@ -61,11 +61,11 @@ class TestMapWindow:
         map_app.root.update()
         assert len(_toplevels(map_app.root)) == before      # no second window
 
-    def test_close_stops_the_worker_threads(self, map_app):
+    def test_confirm_stops_the_worker_threads(self, map_app):
         win, m = _map_widget(map_app.root)
         assert m.running is True
-        # the Close button must go through the wrapped handler
-        _button(win, "Close").invoke()
+        # the 确认 button must go through the wrapped handler
+        _button(win, "确认").invoke()
         map_app.root.update()
         assert m.running is False                            # threads can exit
         assert _toplevels(map_app.root) == []
@@ -89,3 +89,35 @@ class TestMapWindow:
         app.root.update()
         assert _toplevels(app.root) == []
         app.worker = None
+
+
+class TestPickNeedsConfirmation:
+    """A click previews; only 确认 writes the coordinates into the form."""
+
+    def test_click_does_not_touch_the_form(self, map_app):
+        win, m = _map_widget(map_app.root)
+        map_app.field_vars["latitude"].set("")
+        map_app.field_vars["longitude"].set("")
+        m.map_click_callback((22.5, 114.0))
+        assert map_app.field_vars["latitude"].get() == ""
+        assert map_app.field_vars["longitude"].get() == ""
+
+    def test_confirm_writes_and_closes(self, map_app):
+        win, m = _map_widget(map_app.root)
+        m.map_click_callback((22.5, 114.0))
+        _button(win, "确认").invoke()
+        map_app.root.update()
+        assert map_app.field_vars["latitude"].get() == "22.500000"
+        assert map_app.field_vars["longitude"].get() == "114.000000"
+        assert _toplevels(map_app.root) == []
+
+    def test_close_without_confirm_keeps_old_values(self, map_app):
+        win, m = _map_widget(map_app.root)
+        map_app.field_vars["latitude"].set("1.0")
+        map_app.field_vars["longitude"].set("2.0")
+        m.map_click_callback((22.5, 114.0))
+        win.destroy()                      # the X button path
+        map_app.root.update()
+        map_app._map_win = None
+        assert map_app.field_vars["latitude"].get() == "1.0"
+        assert map_app.field_vars["longitude"].get() == "2.0"

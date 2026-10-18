@@ -48,10 +48,17 @@ def no_dialogs(mod, monkeypatch):
         monkeypatch.setattr(mod.messagebox, name, lambda *a, **k: True)
 
 
-@pytest.fixture
-def app(mod, tk_root, monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "APP_DIR", str(tmp_path), raising=True)
-    a = mod.ExifCraft(tk_root)
+@pytest.fixture(scope="module")
+def _app_instance(tk_root, tmp_path_factory):
+    """One ExifCraft window per test module.
+
+    Building the whole UI costs ~0.7s; doing it per test was the single
+    biggest cost in the suite (~100s of the runtime). Tests get a shared
+    instance with its state reset before each one instead.
+    """
+    app_dir = tmp_path_factory.mktemp("appdir")
+    ExifCraft.APP_DIR = str(app_dir)
+    a = ExifCraft.ExifCraft(tk_root)
     yield a
     if a._preview_after_id:
         try:
@@ -60,6 +67,55 @@ def app(mod, tk_root, monkeypatch, tmp_path):
             pass
     for child in tk_root.winfo_children():
         child.destroy()
+
+
+def _reset_state(app) -> None:
+    """Put a shared instance back to "just built" before the next test."""
+    app.input_files.clear()
+    app.file_checked.clear()
+    app._import_order.clear()
+    app._sort_col, app._sort_rev = None, False
+    app._drag = None
+    app._preview_cache.clear()
+    app._preview_photo = None
+    app.worker = None
+
+    for var in (app.src_var, app.out_var):
+        var.set("")
+    app.overwrite_var.set(False)
+    for v in app.write_flags.values():
+        v.set(False)
+    for v in app.clear_flags.values():
+        v.set(False)
+    for v in app.field_vars.values():
+        v.set("")
+    app.date_flag.set(False)
+    app.date_clear.set(False)
+    app.gps_clear.set(False)
+    app.gps_clear_btn.configure(text="✕ 清除 GPS 信息")
+
+    app.progress["value"] = 0
+    app.progress_text.configure(text="")
+    app._set_error("")
+    app.status_var.set("Ready")
+    app.log.configure(state="normal")
+    app.log.delete("1.0", "end")
+    app.log.configure(state="disabled")
+
+    if app.bm is not None:
+        app.bm.cleanup()                    # backups + journal from last test
+    app._update_rollback_btn()              # no backups -> button disabled
+    if app._map_win is not None and app._map_win.winfo_exists():
+        app._map_win.destroy()
+    app._map_win = None
+
+    app._refresh_list()                     # empty list, footer back to zero
+
+
+@pytest.fixture
+def app(_app_instance):
+    _reset_state(_app_instance)
+    return _app_instance
 
 
 def _base_exif(*, gps: bool, orientation: int | None) -> dict:
