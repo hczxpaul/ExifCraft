@@ -743,6 +743,8 @@ class ExifCraft:
         self._import_order: list[str] = []          # order as loaded, for "no sort"
         self._preview_refit_id: str | None = None   # preview resize debounce
         self._map_win: tk.Toplevel | None = None    # single map-picker window
+        self._tile_cache = None                     # TileCache, created lazily
+        self._map_cls = None                        # CachedMapView, resolved once
         self._preview_box: tk.Frame | None = None
         self._fit_after_id: str | None = None       # column auto-fit debounce
         self._name_font = tkfont.Font(font=Theme.FONT_MONO)   # for measuring names
@@ -2504,13 +2506,23 @@ class ExifCraft:
 
         win = tk.Toplevel(self.root)
         win.title(f"{self.APP_NAME}  ·  Map picker")
-        win.geometry("640x520")
+        win.geometry("640x560")
         win.configure(bg=Theme.BG)
         self._apply_icon(win)
         self._map_win = win
 
-        m = TkinterMapView(win, width=640, height=440, corner_radius=0)
-        m.pack(fill="both", expand=True, padx=10, pady=10)
+        # tiles persist in one sqlite file next to the app, so a place you
+        # already looked at opens instantly the second time
+        import map_cache
+        if getattr(self, "_tile_cache", None) is None:
+            self._tile_cache = map_cache.TileCache(
+                os.path.join(APP_DIR, "map_tiles.db"))
+        cache = self._tile_cache
+        if getattr(self, "_map_cls", None) is None:
+            self._map_cls = map_cache.build_widget_class()
+
+        m = self._map_cls(win, cache, width=640, height=440, corner_radius=0)
+        m.pack(fill="both", expand=True, padx=10, pady=(10, 4))
 
         try:
             lat = float(self.field_vars["latitude"].get())
@@ -2555,8 +2567,32 @@ class ExifCraft:
                 win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", close)
-        ttk.Button(win, text="Close", style="Ghost.TButton",
-                   command=close).pack(pady=(0, 10))
+
+        bar = ttk.Frame(win, style="App.TFrame")
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        cache_lbl = ttk.Label(bar, text="", style="Hint.TLabel")
+        cache_lbl.pack(side="left")
+
+        def refresh_stats():
+            try:
+                n, size = cache.stats()
+                cache_lbl.configure(
+                    text=f"本地缓存 {map_cache.format_size(size)} · {n} 张瓦片")
+            except Exception:
+                pass
+
+        def clear_cache():
+            cache.clear()
+            refresh_stats()
+            self._log("已清理地图瓦片缓存。", "muted")
+
+        refresh_stats()
+        win.after(1500, refresh_stats)      # after the first tiles land
+
+        ttk.Button(bar, text="Close", style="Ghost.TButton",
+                   command=close).pack(side="right")
+        ttk.Button(bar, text="清理缓存", style="Subtle.TButton",
+                   command=clear_cache).pack(side="right", padx=(0, 6))
 
     # ------------------------------------------------------------------
     #  Writing (off the UI thread)

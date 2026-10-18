@@ -27,6 +27,19 @@ def _map_widget(root):
                  if isinstance(w, TkinterMapView)][0]
 
 
+def _button(win, text):
+    """Find a button by label, wherever it sits in the window tree."""
+    def walk(w):
+        for child in w.winfo_children():
+            if isinstance(child, ttk.Button) and str(child.cget("text")) == text:
+                return child
+            found = walk(child)
+            if found is not None:
+                return found
+        return None
+    return walk(win)
+
+
 @pytest.fixture
 def map_app(app):
     app._open_map()
@@ -52,8 +65,7 @@ class TestMapWindow:
         win, m = _map_widget(map_app.root)
         assert m.running is True
         # the Close button must go through the wrapped handler
-        btn = [w for w in win.winfo_children() if isinstance(w, ttk.Button)][-1]
-        btn.invoke()
+        _button(win, "Close").invoke()
         map_app.root.update()
         assert m.running is False                            # threads can exit
         assert _toplevels(map_app.root) == []
