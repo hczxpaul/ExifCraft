@@ -177,15 +177,18 @@ pyinstaller --onefile --windowed --icon ExifCraft.ico ExifCraft.pyw
 
 ```
 ExifCraft-X/
-├── ExifCraft.pyw     # 主程序（UI + 批量写入流程）
-├── exif_patch.py     # 字节级 EXIF 写入：只改目标字段，不重新编码像素
-├── map_cache.py      # 地图瓦片的 SQLite 缓存与 LRU 淘汰
-├── ExifCraft.ico     # 应用图标（Windows，多分辨率）
-├── preview.png       # 界面预览图
-├── requirements.txt  # 依赖清单
-├── tests/            # 209 项测试
+├── ExifCraft.pyw        # 主程序（UI + 批量写入流程）       ← 沿用上游文件名
+├── ExifCraft.ico        # 应用图标（Windows，多分辨率）     ← 沿用上游文件名
+├── exif_patch.py        # 【新增】字节级 EXIF 写入：只改目标字段，不重新编码像素
+├── map_cache.py         # 【新增】地图瓦片的 SQLite 缓存与 LRU 淘汰
+├── ExifCraft-X.manifest # 【新增】DPI 感知（4K / 200% 缩放）
+├── preview.png          # 界面预览图
+├── requirements.txt     # 依赖清单
+├── tests/               # 213 项测试
 └── README.md
 ```
+
+> **命名约定**：上游已有的文件保留原名，便于将来同步上游改动；本版本新增的模块用中性命名（不绑死产品名）。因此入口文件与类名仍为 `ExifCraft`，只有新增文件带 `ExifCraft-X` 前缀。
 
 ## 📄 许可证
 

@@ -25,7 +25,7 @@ os.chdir(APP_DIR)
 APP_NAME  = "ExifCraft-X"
 ENTRY     = "ExifCraft.pyw"
 ICON      = "ExifCraft.ico"
-MANIFEST  = "ExifCraft.manifest"   # DPI awareness for 4K / 200% scaling
+MANIFEST  = "ExifCraft-X.manifest"   # DPI awareness for 4K / 200% scaling
 
 MIN_PY = (3, 10)   # source uses `X | None` annotations — 3.9 exe would crash at startup
 
