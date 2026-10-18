@@ -187,4 +187,4 @@ ExifCraft/
 
 ## 📄 许可证
 
-[MIT](LICENSE) © yohoten
+[MIT](LICENSE) © yohoten, hczxpaul
