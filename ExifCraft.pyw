@@ -847,7 +847,7 @@ class ExifCraft:
         self._sort_col: str | None = None           # None = import order
         self._sort_rev: bool = False
         self._import_order: list[str] = []          # order as loaded, for "no sort"
-        self._grip_origin: tuple[int, int] | None = None   # preview drag session
+        self._preview_refit_id: str | None = None   # preview resize debounce
         self._preview_box: tk.Frame | None = None
         self._fit_after_id: str | None = None       # column auto-fit debounce
         self._name_font = tkfont.Font(font=Theme.FONT_MONO)   # for measuring names
@@ -968,6 +968,40 @@ class ExifCraft:
         y = max(20, (sh - h) // 2 - 20)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self.root.minsize(min(1000, sw - 100), min(680, sh - 160))
+        self.root.update_idletasks()
+        self._setup_column_widths()
+        # the nested Panedwindow reports a bogus height until it has been laid
+        # out once — place the sashes again shortly after
+        self.root.after(150, self._setup_column_widths)
+
+    def _setup_column_widths(self) -> None:
+        """Place the two sashes: files gets a fixed slab, the rest is split
+        55/45 between the form and the preview.
+
+        Panedwindow sizes panes by their content's requested width, and the
+        preview label requests almost nothing — without this the preview
+        column starts out as a sliver.
+        """
+        paned = getattr(self, "_main_paned", None)
+        if paned is None or not paned.panes():
+            return
+        total = paned.winfo_width()
+        if total < self._px(300):
+            return
+        files_w = min(self._px(340), int(total * 0.4))
+        rest    = total - files_w
+        mid_w   = int(rest * 0.55)
+        paned.sashpos(0, files_w)
+        paned.sashpos(1, files_w + mid_w)
+
+        # the log pane gets a fixed slab at the bottom (4 lines + padding);
+        # weight alone left it with a single visible line
+        mid = getattr(self, "_mid_paned", None)
+        if mid is not None and mid.panes():
+            h = mid.winfo_height()
+            if h > self._px(260):
+                log_h = self._px(92)
+                mid.sashpos(0, max(self._px(140), h - log_h))
 
     # ------------------------------------------------------------------
     #  Theming
@@ -1072,9 +1106,15 @@ class ExifCraft:
               lightcolor=[("focus", base.PRIMARY), ("!focus", base.BORDER)],
               darkcolor=[("focus", base.PRIMARY), ("!focus", base.BORDER)])
 
-        # File table (ttk.Treeview): one row per image, five columns.
+        # File table (ttk.Treeview): one row per image, three columns.
         # rowheight is set in pixels so the DPI-aware build keeps the same
         # visual rhythm; the checkbox lives in the tree column as an image.
+        # Paned sashes: the clam default is a hairline that is nearly
+        # impossible to grab, so give it real width and a visible colour.
+        s.configure("TPanedwindow", background=base.BG)
+        s.configure("Sash", sashthickness=self._px(7), gripcount=0,
+                    background=base.BORDER)
+        s.map("Sash", background=[("active", base.BORDER_FOCUS)])
         s.configure("Files.Treeview",
                     background=base.SURFACE, fieldbackground=base.SURFACE,
                     foreground=base.TEXT, rowheight=self._px(28), borderwidth=0,
@@ -1098,6 +1138,13 @@ class ExifCraft:
                     bordercolor=base.BG, arrowcolor=base.TEXT_3)
         s.map("Vertical.TScrollbar",
               background=[("active", base.BORDER_FOCUS), ("pressed", base.TEXT_3)])
+
+        # thin horizontal scrollbar used by the path fields; only shown when
+        # the path overflows, so it must not add height in the normal case
+        s.configure("Path.Horizontal.TScrollbar",
+                    background=base.BORDER, troughcolor=base.SURFACE,
+                    bordercolor=base.SURFACE, arrowcolor=base.TEXT_3,
+                    width=self._px(9))
 
         # Progressbar
         s.configure("Accent.Horizontal.TProgressbar",
@@ -1144,41 +1191,68 @@ class ExifCraft:
                   foreground=Theme.TEXT_3).pack(side="left", padx=(2, 0), pady=(4, 0))
         ttk.Label(header, text=self.APP_TAG, style="Subtitle.TLabel").pack(side="right")
 
-        # ---- body: two-column (cards) layout
-        body = ttk.Frame(outer, style="App.TFrame")
+        # ---- body: three resizable columns (files / EXIF / preview).
         # NB: body is NOT packed here (see the bottom-up packing block at the
         # end of _build) — it must claim space last so the action bar stays on
         # screen when the window is shorter than the content wants to be.
-        body.columnconfigure(0, weight=1, uniform="col")
-        body.columnconfigure(1, weight=1, uniform="col")
-        body.rowconfigure(0, weight=1)
+        body = ttk.Frame(outer, style="App.TFrame")
 
-        # --- left column
-        left = ttk.Frame(body, style="App.TFrame")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        main_paned = ttk.Panedwindow(body, orient="horizontal")
+        main_paned.pack(fill="both", expand=True)
+        self._main_paned = main_paned
 
-        src_card = Card(left, title="Source  ·  源文件")
+        files_pane = ttk.Frame(main_paned, style="App.TFrame",
+                               width=self._px(340))
+        prev_pane  = ttk.Frame(main_paned, style="App.TFrame",
+                               width=self._px(380))
+        # middle column is itself split: EXIF form above, activity log below
+        mid_paned  = ttk.Panedwindow(main_paned, orient="vertical")
+        form_holder = ttk.Frame(mid_paned, style="App.TFrame")
+        log_holder  = ttk.Frame(mid_paned, style="App.TFrame")
+        mid_paned.add(form_holder, weight=8)
+        mid_paned.add(log_holder,  weight=1)
+        self._mid_paned = mid_paned
+
+        # weights are only a starting ratio — the user drags the sashes.
+        # The explicit widths matter: a pane whose content has no natural
+        # width (the preview label) would otherwise start out tiny.
+        main_paned.add(files_pane, weight=3)
+        main_paned.add(mid_paned,  weight=4)
+        main_paned.add(prev_pane,  weight=4)
+
+        # --- column 1: files
+        src_card = Card(files_pane, title="Source  ·  源文件")
         src_card.pack(fill="both", expand=True)
 
-        # source row
-        row = ttk.Frame(src_card.body, style="CardInner.TFrame")
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Path", style="Field.TLabel").pack(side="left")
-        ttk.Entry(row, textvariable=self.src_var, style="Field.TEntry",
-                  font=Theme.FONT, width=1).pack(side="left", fill="x", expand=True, padx=(8, 8))
-        ttk.Button(row, text="File",  style="Ghost.TButton",
-                   command=self._pick_file).pack(side="left", padx=2)
-        ttk.Button(row, text="Folder", style="Ghost.TButton",
-                   command=self._pick_folder).pack(side="left", padx=2)
+        # source row — the path field takes the full width and the buttons
+        # move to a second line: a 340px column cannot host label + field +
+        # two buttons and still show a filename
+        path_box = ttk.Frame(src_card.body, style="CardInner.TFrame")
+        path_box.pack(fill="x", pady=2)
+        head = ttk.Frame(path_box, style="CardInner.TFrame")
+        head.pack(fill="x")
+        ttk.Label(head, text="Path", style="Field.TLabel").pack(side="left")
+        self._src_entry = self._path_entry(head, self.src_var)
+
+        btns = ttk.Frame(path_box, style="CardInner.TFrame")
+        btns.pack(fill="x", pady=(3, 0))
+        ttk.Button(btns, text="Folder", style="Ghost.TButton",
+                   command=self._pick_folder).pack(side="right", padx=(4, 0))
+        ttk.Button(btns, text="File",  style="Ghost.TButton",
+                   command=self._pick_file).pack(side="right", padx=(4, 0))
 
         # output row
-        row = ttk.Frame(src_card.body, style="CardInner.TFrame")
-        row.pack(fill="x", pady=(6, 2))
-        ttk.Label(row, text="Output", style="Field.TLabel").pack(side="left")
-        ttk.Entry(row, textvariable=self.out_var, style="Field.TEntry",
-                  font=Theme.FONT, width=1).pack(side="left", fill="x", expand=True, padx=(8, 8))
-        ttk.Button(row, text="Browse", style="Ghost.TButton",
-                   command=self._pick_output).pack(side="left", padx=2)
+        out_box = ttk.Frame(src_card.body, style="CardInner.TFrame")
+        out_box.pack(fill="x", pady=(6, 2))
+        out_head = ttk.Frame(out_box, style="CardInner.TFrame")
+        out_head.pack(fill="x")
+        ttk.Label(out_head, text="Output", style="Field.TLabel").pack(side="left")
+        self._out_entry = self._path_entry(out_head, self.out_var)
+
+        out_btns = ttk.Frame(out_box, style="CardInner.TFrame")
+        out_btns.pack(fill="x", pady=(3, 0))
+        ttk.Button(out_btns, text="Browse", style="Ghost.TButton",
+                   command=self._pick_output).pack(side="right", padx=(4, 0))
 
         # file list — three columns: ☑ / 文件名 / 状态.
         # The checkbox needs the tree column (#0) because that is the only
@@ -1257,17 +1331,15 @@ class ExifCraft:
         # keep the chip in sync if the flag is ever changed in code
         self.overwrite_var.trace_add("write", lambda *_a: ow_render())
 
-        # --- right column: wrapped in a scrolling canvas.
-        # The right column's natural height (~1050 px with the larger
-        # preview) exceeds the usable body height on a 1080p screen —
-        # without scrolling, the packer squeezes the last cards (GPS!)
-        # down to nothing. See _on_mousewheel for the scroll routing.
-        right_scroll = tk.Canvas(body, bg=Theme.BG, highlightthickness=0, bd=0)
-        right_scroll.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        right_sb = ttk.Scrollbar(body, orient="vertical",
+        # --- column 2: EXIF form, inside a scrolling canvas.
+        # The form's natural height (~700 px) still exceeds a laptop body, so
+        # it keeps its own scroll area. See _on_mousewheel for the routing.
+        right_scroll = tk.Canvas(form_holder, bg=Theme.BG, highlightthickness=0, bd=0)
+        right_scroll.pack(side="left", fill="both", expand=True)
+        right_sb = ttk.Scrollbar(form_holder, orient="vertical",
                                  style="Vertical.TScrollbar",
                                  command=right_scroll.yview)
-        right_sb.grid(row=0, column=2, sticky="ns")
+        right_sb.pack(side="right", fill="y")
         right_scroll.configure(yscrollcommand=right_sb.set)
 
         right = ttk.Frame(right_scroll, style="App.TFrame")
@@ -1289,6 +1361,29 @@ class ExifCraft:
 
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
+        # --- activity log: a few lines at the bottom of the middle column.
+        # It used to span the whole window width for 4 lines of text.
+        log_frame = ttk.Frame(log_holder, style="Log.TFrame", padding=(6, 4))
+        log_frame.pack(fill="both", expand=True)
+        self.log = tk.Text(log_frame, height=4, wrap="word", state="disabled",
+                           background=Theme.SURFACE_2, foreground=Theme.TEXT,
+                           insertbackground=Theme.TEXT,
+                           relief="flat", highlightthickness=1,
+                           highlightbackground=Theme.BORDER,
+                           font=Theme.FONT_MONO, bd=0, padx=4, pady=3)
+        self.log.pack(side="left", fill="both", expand=True)
+        log_sb = ttk.Scrollbar(log_frame, orient="vertical",
+                               style="Vertical.TScrollbar",
+                               command=self.log.yview)
+        log_sb.pack(side="right", fill="y")
+        self.log.configure(yscrollcommand=log_sb.set)
+
+        # color tags for log
+        self.log.tag_configure("ok",    foreground=Theme.SUCCESS)
+        self.log.tag_configure("err",   foreground=Theme.ERROR)
+        self.log.tag_configure("warn",  foreground=Theme.WARNING)
+        self.log.tag_configure("muted", foreground=Theme.TEXT_3)
+
         # ---- quick selection sits at the TOP of the column: it decides
         # which modules get written, and it must stay visible even when the
         # preview is dragged taller. Grid (not pack) so the five buttons
@@ -1305,14 +1400,23 @@ class ExifCraft:
                        command=lambda k=key: self._quick_group(k)
                        ).grid(row=0, column=i + 1, sticky="ew", padx=(3, 0))
 
-        # Preview card — visual confirmation of the selected file
-        prev_card = Card(right, title="Preview  ·  预览")
-        prev_card.pack(fill="x")
+        # --- column 3: preview. Its own vertical split (image / meta) so the
+        # picture can be made taller by dragging — the same gesture as the
+        # column sashes, instead of the little grip handle it used to have.
+        prev_card = Card(prev_pane, title="Preview  ·  预览")
+        prev_card.pack(fill="both", expand=True)
 
-        prev_box = tk.Frame(prev_card.body, bg=Theme.SURFACE_2,
-                            height=self._px(320))
-        prev_box.pack(fill="x")
-        prev_box.pack_propagate(False)               # height is set explicitly
+        prev_split = ttk.Panedwindow(prev_card.body, orient="vertical")
+        prev_split.pack(fill="both", expand=True)
+        self._prev_split = prev_split
+
+        img_holder  = ttk.Frame(prev_split, style="CardInner.TFrame")
+        meta_holder = ttk.Frame(prev_split, style="CardInner.TFrame")
+        prev_split.add(img_holder,  weight=8)
+        prev_split.add(meta_holder, weight=1)
+
+        prev_box = tk.Frame(img_holder, bg=Theme.SURFACE_2)
+        prev_box.pack(fill="both", expand=True)
         self._preview_lbl = tk.Label(
             prev_box, text="选择文件以预览",
             bg=Theme.SURFACE_2, fg=Theme.TEXT_3, font=Theme.FONT,
@@ -1320,46 +1424,11 @@ class ExifCraft:
         self._preview_lbl.pack(fill="both", expand=True)
         self._preview_box = prev_box
 
-        # drag handle under the box — drag up/down to resize the preview
-        grip = tk.Canvas(prev_card.body, height=self._px(13), bg=Theme.SURFACE,
-                        highlightthickness=0, bd=0, cursor="sb_v_double_arrow")
-        grip.pack(fill="x")
+        self._preview_meta = ttk.Label(meta_holder, text="", style="Hint.TLabel")
+        self._preview_meta.pack(anchor="nw", pady=(4, 0))
 
-        def _draw_grip(_e=None):
-            grip.delete("all")
-            cx = grip.winfo_width() // 2
-            cy = grip.winfo_height() // 2
-            step, r = self._px(6), max(1, self._px(1))
-            for i in (-1, 0, 1):
-                x = cx + i * step
-                grip.create_oval(x - r, cy - r, x + r, cy + r,
-                                 fill=Theme.BORDER_FOCUS, outline="")
-
-        grip.bind("<Configure>", _draw_grip)
-
-        def _grip_press(e):
-            self._grip_origin = (e.y_root, prev_box.winfo_height())
-
-        def _grip_drag(e):
-            if self._grip_origin is None:
-                return
-            y0, h0 = self._grip_origin
-            lo = self._px(140)                       # never collapse the box
-            hi = max(lo, self.root.winfo_height() - self._px(420))
-            prev_box.configure(height=max(lo, min(hi, h0 + (e.y_root - y0))))
-
-        def _grip_release(_e):
-            if self._grip_origin is None:
-                return
-            self._grip_origin = None
-            self._resize_preview_budget()            # re-decode at the new size
-
-        grip.bind("<ButtonPress-1>",   _grip_press)
-        grip.bind("<B1-Motion>",       _grip_drag)
-        grip.bind("<ButtonRelease-1>", _grip_release)
-
-        self._preview_meta = ttk.Label(prev_card.body, text="", style="Hint.TLabel")
-        self._preview_meta.pack(anchor="w", pady=(2, 0))
+        # the decode budget follows whatever size the image area ends up with
+        img_holder.bind("<Configure>", self._schedule_preview_refit)
 
         # Camera card
         cam_card = Card(right, title="Camera  ·  相机")
@@ -1495,30 +1564,6 @@ class ExifCraft:
         self.progress_text = ttk.Label(prog_row, text="", style="Status.TLabel")
         self.progress_text.pack(side="left", padx=(8, 0))
 
-        # log
-        log_holder = ttk.Frame(outer, style="App.TFrame")
-
-        log_frame = ttk.Frame(log_holder, style="Log.TFrame", padding=(8, 6))
-        log_frame.pack(fill="x")
-        self.log = tk.Text(log_frame, height=4, wrap="word", state="disabled",
-                           background=Theme.SURFACE_2, foreground=Theme.TEXT,
-                           insertbackground=Theme.TEXT,
-                           relief="flat", highlightthickness=1,
-                           highlightbackground=Theme.BORDER,
-                           font=Theme.FONT_MONO, bd=0, padx=4, pady=4)
-        self.log.pack(side="left", fill="both", expand=True)
-        log_sb = ttk.Scrollbar(log_frame, orient="vertical",
-                               style="Vertical.TScrollbar",
-                               command=self.log.yview)
-        log_sb.pack(side="right", fill="y")
-        self.log.configure(yscrollcommand=log_sb.set)
-
-        # color tags for log
-        self.log.tag_configure("ok",    foreground=Theme.SUCCESS)
-        self.log.tag_configure("err",   foreground=Theme.ERROR)
-        self.log.tag_configure("warn",  foreground=Theme.WARNING)
-        self.log.tag_configure("muted", foreground=Theme.TEXT_3)
-
         # status bar
         status_bar = ttk.Frame(outer, style="App.TFrame")
         self.status_lbl = ttk.Label(status_bar, textvariable=self.status_var,
@@ -1528,9 +1573,8 @@ class ExifCraft:
         self.err_lbl.pack(side="right")
 
         # ---- bottom-up packing: each row takes its space before body,
-        # so on a short window the elastic list shrinks, not the action bar.
+        # so on a short window the elastic pane area shrinks, not the buttons.
         status_bar.pack(side="bottom", fill="x", pady=(6, 0))
-        log_holder.pack(side="bottom", fill="x", pady=(6, 0))
         prog_row.pack(side="bottom", fill="x")
         actions.pack(side="bottom", fill="x", pady=(12, 5))
         body.pack(fill="both", expand=True, pady=(10, 0))
@@ -1540,12 +1584,14 @@ class ExifCraft:
         # initial render of the file list: with no files picked yet this
         # plants the empty-state hint row (otherwise the list is a blank void)
         self._refresh_list()
+        # an empty log pane looks like a broken panel — seed it with a line
+        self._log(f"{self.APP_NAME} v{self.APP_VER} 已就绪 · 选择文件后开始。", "muted")
 
     # ------------------------------------------------------------------
-    #  Right-column scrolling
+    #  Middle-column (EXIF form) scrolling
     # ------------------------------------------------------------------
-    def _wheel_over_right(self, x_root: int, y_root: int) -> bool:
-        """True when a screen point lands inside the scrollable right column.
+    def _wheel_over_form(self, x_root: int, y_root: int) -> bool:
+        """True when a screen point lands inside the scrollable form column.
 
         Walks the widget under the pointer up the parent chain, so a wheel
         event over any card counts — not just the bare canvas.
@@ -1557,8 +1603,8 @@ class ExifCraft:
             w = w.master
         return False
 
-    def _scroll_right_column(self, steps: int) -> bool:
-        """Scroll the right column by *steps* wheel-notches (down if > 0).
+    def _scroll_form_column(self, steps: int) -> bool:
+        """Scroll the form column by *steps* wheel-notches (down if > 0).
 
         yview_scroll's "units" step depends on the canvas -scrollincrement
         option (0 by default), so the moveto fraction is computed directly.
@@ -1587,10 +1633,62 @@ class ExifCraft:
         """Route the wheel to the right column only when the pointer is
         over it — the file list on the left keeps its native wheel
         behaviour. Returns "break" when the event was consumed."""
-        if not self._wheel_over_right(event.x_root, event.y_root):
+        if not self._wheel_over_form(event.x_root, event.y_root):
             return
-        self._scroll_right_column(self._wheel_steps(event.delta))
+        self._scroll_form_column(self._wheel_steps(event.delta))
         return "break"
+
+    def _path_entry(self, parent, var: tk.StringVar) -> ttk.Entry:
+        """Single-line path field: right aligned, tail first, scrollable.
+
+        A media-library path is routinely 100+ characters and a plain Entry
+        shows it from the left — exactly the part that never identifies the
+        file. This variant aligns right, scrolls to the end after every
+        change (so the filename is always visible), and only shows its
+        horizontal scrollbar when the text really overflows, so short paths
+        keep the compact single-row look.
+        """
+        holder = ttk.Frame(parent, style="CardInner.TFrame")
+        holder.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        holder.columnconfigure(0, weight=1)
+
+        entry = ttk.Entry(holder, textvariable=var, style="Field.TEntry",
+                          font=Theme.FONT_MONO, width=1, justify="right")
+        entry.grid(row=0, column=0, sticky="ew")
+
+        hsb = ttk.Scrollbar(holder, orient="horizontal",
+                            style="Path.Horizontal.TScrollbar",
+                            command=entry.xview)
+
+        def _sync(first, last):
+            hsb.set(first, last)
+            overflow = float(first) > 0.001 or float(last) < 0.999
+            if overflow and not hsb.winfo_ismapped():
+                hsb.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+            elif not overflow and hsb.winfo_ismapped():
+                hsb.grid_remove()
+
+        entry.configure(xscrollcommand=_sync)
+        var.trace_add("write", lambda *_a: self._scroll_path_to_tail(entry))
+        self.root.after_idle(lambda: self._scroll_path_to_tail(entry))
+        return entry
+
+    def _scroll_path_to_tail(self, entry: ttk.Entry) -> None:
+        """Show the end of the path (the filename), but only when it overflows.
+
+        Deferred: the Entry re-lays out its text on the next idle cycle, and
+        xview applied before that is ignored. Calling xview_moveto(1.0) on a
+        SHORT string leaves a tiny non-zero 'first' behind, which would then
+        make the scrollbar think the text overflows — so reset to the start
+        when everything already fits (justify="right" still right-aligns it).
+        """
+        def _do():
+            try:
+                _first, last = entry.xview()
+                entry.xview_moveto(1.0 if last < 0.999 else 0.0)
+            except tk.TclError:
+                pass
+        self.root.after_idle(_do)
 
     def _labeled_entry(self, parent, label, var, *, hint=None, col=None, field=None):
         """Build a label + entry (+ optional hint) block. Returns its frame.
@@ -1904,6 +2002,33 @@ class ExifCraft:
         img, size = self._load_thumb_image(path)
         return ImageTk.PhotoImage(img), size
 
+    def _schedule_preview_refit(self, _e=None) -> None:
+        """Coalesce resize events from the preview column.
+
+        Dragging a sash fires <Configure> dozens of times per second; decoding
+        on each one would stutter (a 4K JPEG takes ~20ms to shrink).
+        """
+        if self._preview_refit_id:
+            try:
+                self.root.after_cancel(self._preview_refit_id)
+            except tk.TclError:
+                pass
+        try:
+            self._preview_refit_id = self.root.after(150, self._refit_preview)
+        except tk.TclError:                 # window is closing
+            self._preview_refit_id = None
+
+    def _refit_preview(self) -> None:
+        self._preview_refit_id = None
+        try:
+            if not self._preview_box or not self._preview_box.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self._preview_budget() == tuple(self.PREVIEW_MAX):
+            return                       # same size: skip the decode entirely
+        self._resize_preview_budget()
+
     def _resize_preview_budget(self) -> None:
         """Re-fit the preview after the drag handle changed the box size.
 
@@ -2193,6 +2318,11 @@ class ExifCraft:
         the space the panel really has.
         """
         self._fit_after_id = None
+        try:
+            if not self.file_list.winfo_exists():
+                return
+        except tk.TclError:                 # window already torn down
+            return
         if not self.input_files:
             self.file_list.column("name", width=self._px(170))
             return
@@ -2208,9 +2338,12 @@ class ExifCraft:
 
     def _schedule_fit_columns(self, _e=None) -> None:
         """Coalesce resize events into a single measurement pass."""
-        if self._fit_after_id:
-            self.root.after_cancel(self._fit_after_id)
-        self._fit_after_id = self.root.after(80, self._fit_name_column)
+        try:
+            if self._fit_after_id:
+                self.root.after_cancel(self._fit_after_id)
+            self._fit_after_id = self.root.after(80, self._fit_name_column)
+        except tk.TclError:                 # window is closing
+            self._fit_after_id = None
 
     def _refresh_list_footer(self) -> None:
         n = len(self.input_files)
