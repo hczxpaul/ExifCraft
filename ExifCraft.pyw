@@ -2761,22 +2761,32 @@ class ExifCraft:
     #  Rollback (UI)
     # ------------------------------------------------------------------
     def _update_rollback_btn(self) -> None:
-        n = self.bm.backup_count() if self.bm is not None else 0
-        self.rollback_btn.configure(state="normal" if n else "disabled")
+        # Any journalled write can be undone: overwrite restores the backup,
+        # copy deletes the generated file. Keying this on backup_count() left
+        # the button dead in copy mode — the default mode — for no reason.
+        has_work = self.bm is not None and bool(self.bm.recs)
+        self.rollback_btn.configure(state="normal" if has_work else "disabled")
 
     def _rollback_clicked(self) -> None:
         if self.bm is None or not self.bm.recs:
             return
-        n = self.bm.backup_count()
+        copies = sum(1 for r in self.bm.recs if r.mode == "copy")
+        restores = sum(1 for r in self.bm.recs
+                       if r.mode == "overwrite" and r.backup)
         mb = self.bm.backup_bytes() / 1024 / 1024
+        parts = []
+        if copies:
+            parts.append(f"删除 {copies} 个生成的副本")
+        if restores:
+            parts.append(f"还原 {restores} 个原文件（备份 {mb:.1f} MB）")
+        what = "，".join(parts) or "撤销本次会话的修改"
         if not messagebox.askyesno(
                 self.APP_NAME,
-                f"撤销本次会话的全部修改？\n\n"
-                f"将还原 {n} 个文件（备份占用 {mb:.1f} MB）。"):
+                f"撤销本次会话的全部修改？\n\n将{what}。"):
             return
         done, skipped = self.bm.rollback()
-        self._log(f"回滚完成，还原 {done} 项。", "ok" if done else "warn")
-        self._set_status(f"已回滚 {done} 项")
+        self._log(f"回滚完成，撤销 {done} 项。", "ok" if done else "warn")
+        self._set_status(f"已撤销 {done} 项")
         self.progress_text.configure(text="")
         self._update_rollback_btn()
         self._refresh_status_column()      # rows fall back to "就绪"

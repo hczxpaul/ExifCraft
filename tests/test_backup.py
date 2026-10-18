@@ -414,3 +414,66 @@ class TestFileTickBoxes:
         rows = open(target, encoding="utf-8").read().strip().splitlines()
         assert len(rows) == 3                   # header + 2 ticked files
         assert "c2.jpg" not in "".join(rows)
+
+
+class TestRollbackBothModes:
+    """Rollback undoes whatever this session did, either mode.
+
+    Copy mode deletes the generated *_exif file (the original was never
+    touched); overwrite mode restores the backup.
+    """
+
+    def test_copy_mode_button_is_enabled(self, app, no_dialogs, jpeg_factory,
+                                         tmp_path):
+        src = str(jpeg_factory("copybtn.jpg"))
+        app._write_worker([src], str(tmp_path / "out"), PARAMS, overwrite=False)
+        app.root.update()
+        assert str(app.rollback_btn["state"]) == "normal"
+
+    def test_copy_mode_rollback_deletes_the_copies(self, app, no_dialogs,
+                                                   jpeg_factory, tmp_path):
+        src = jpeg_factory("copydel.jpg")
+        original = src.read_bytes()
+        out = tmp_path / "out"
+        app._write_worker([str(src)], str(out), PARAMS, overwrite=False)
+        app.root.update()
+        dst = out / "copydel_exif.jpg"
+        assert dst.exists()
+
+        app._rollback_clicked()
+        app.root.update()
+
+        assert not dst.exists()               # the copy is gone
+        assert src.read_bytes() == original   # the original never changed
+        assert str(app.rollback_btn["state"]) == "disabled"
+
+    def test_overwrite_mode_rollback_restores_the_original(self, app, no_dialogs,
+                                                           jpeg_factory):
+        src = jpeg_factory("ovrrestore.jpg")
+        original = src.read_bytes()
+        app._write_worker([str(src)], "", PARAMS, overwrite=True)
+        app.root.update()
+        assert src.read_bytes() != original
+
+        app._rollback_clicked()
+        app.root.update()
+
+        assert src.read_bytes() == original
+        assert str(app.rollback_btn["state"]) == "disabled"
+
+    def test_prompt_names_the_right_action(self, app, mod, monkeypatch,
+                                           no_dialogs, jpeg_factory, tmp_path):
+        src = str(jpeg_factory("prompt.jpg"))
+        app._write_worker([src], str(tmp_path / "o"), PARAMS, overwrite=False)
+        app.root.update()
+        seen = {}
+
+        def capture(title, message="", **kw):
+            seen["text"] = message
+            return False                    # decline: nothing is deleted
+
+        monkeypatch.setattr(mod.messagebox, "askyesno", capture)
+        app._rollback_clicked()
+
+        assert "删除" in seen["text"] and "副本" in seen["text"]
+        assert "还原" not in seen["text"]
